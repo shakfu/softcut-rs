@@ -1,8 +1,10 @@
-//! softcut demo: four voices over one shared buffer, with the buffer's
-//! waveform, each voice's loop region and playhead drawn live.
+//! softcut demo: four voices over a stereo pair of buffers (L and R), with
+//! both buffers' waveforms, each voice's loop region and playhead drawn live.
+//! Voices 1+2 and 3+4 are linked stereo pairs by default.
 //!
 //! Waveform: click to cut the selected voice, drag to set its loop.
-//! WAV files load into the buffer from the button or by dropping them on the window.
+//! WAV files load into the buffers from the button or by dropping them on the
+//! window, and save from the buffers with "save wav...".
 
 // Per-voice state lives in parallel arrays indexed by voice number.
 #![allow(clippy::needless_range_loop)]
@@ -10,10 +12,11 @@
 mod audio;
 mod wav;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use audio::{Audio, BUFFER_FRAMES, Source, VOICES, WAVE_BINS};
+use audio::{Audio, BUFFER_FRAMES, BUFFERS, Source, VOICES, WAVE_BINS};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use softcut::rt::Returned;
 use softcut::{Engine, EngineCmd, VoiceCmd};
 
 const COLORS: [Color32; VOICES] = [
@@ -22,10 +25,13 @@ const COLORS: [Color32; VOICES] = [
     Color32::from_rgb(120, 200, 110),
     Color32::from_rgb(220, 180, 60),
 ];
+/// Edge fade for "clear loop" and "reverse loop", in seconds.
+const EDIT_FADE: f32 = 0.005;
 
-/// The UI's copy of each voice's settings. softcut has no getters for these;
-/// the UI is the source of truth and pushes every change as a command.
-#[derive(Clone, Copy, PartialEq)]
+/// The UI's copy of each voice's settings. The voice lives on the audio
+/// thread, so the UI is the source of truth and pushes every change as a
+/// command.
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct VoiceUi {
     play: bool,
     rec: bool,
@@ -46,10 +52,15 @@ struct VoiceUi {
     post_hp: f32,
     post_bp: f32,
     post_dry: f32,
+    /// 0 = left buffer, 1 = right. The voice records the matching input channel.
+    buffer: usize,
 }
 
 impl VoiceUi {
     fn preset(i: usize) -> Self {
+        if i % 2 == 1 {
+            return Self::preset(i - 1).partner();
+        }
         let base = Self {
             play: true,
             rec: false,
@@ -62,7 +73,7 @@ impl VoiceUi {
             rec_level: 1.0,
             pre_level: 0.5,
             level: 0.8,
-            pan: 0.0,
+            pan: -1.0,
             input_gain: 0.0,
             post_fc: 8000.0,
             post_rq: 2.0,
@@ -70,35 +81,30 @@ impl VoiceUi {
             post_hp: 0.0,
             post_bp: 0.0,
             post_dry: 1.0,
+            buffer: 0,
         };
         match i {
             0 => Self {
                 input_gain: 1.0,
                 ..base
             },
-            1 => Self {
-                rate: 0.5,
-                pan: -0.6,
-                level: 0.6,
-                ..base
-            },
-            2 => Self {
-                rate: -1.0,
-                loop_start: 1.0,
-                loop_end: 2.5,
-                pan: 0.6,
-                level: 0.5,
-                ..base
-            },
             _ => Self {
-                rate: 2.0,
-                play: false,
-                level: 0.4,
+                rate: -0.5,
+                level: 0.6,
                 post_lp: 1.0,
                 post_dry: 0.0,
-                post_fc: 1500.0,
+                post_fc: 2000.0,
                 ..base
             },
+        }
+    }
+
+    /// The other half of a stereo pair: same settings, other buffer, mirrored pan.
+    fn partner(&self) -> Self {
+        Self {
+            pan: -self.pan,
+            buffer: BUFFERS - 1 - self.buffer,
+            ..*self
         }
     }
 
@@ -112,6 +118,17 @@ impl VoiceUi {
                     out.push($cmd);
                 }
             };
+        }
+        if old.is_none_or(|o| o.buffer != self.buffer) {
+            out.push(EngineCmd::VoiceBuffer(i, self.buffer));
+            for channel in 0..BUFFERS {
+                let amount = if channel == self.buffer { 1.0 } else { 0.0 };
+                out.push(EngineCmd::InputLevel {
+                    channel,
+                    voice: i,
+                    amount,
+                });
+            }
         }
         push!(loop_start, v(LoopStart(self.loop_start)));
         push!(loop_end, v(LoopEnd(self.loop_end)));
@@ -135,14 +152,22 @@ impl VoiceUi {
     }
 }
 
+/// A save waiting for both buffers' snapshots to come back.
+struct PendingSave {
+    path: PathBuf,
+    parts: [Option<Box<[f32]>>; BUFFERS],
+}
+
 struct App {
     audio: Audio,
     voices: [VoiceUi; VOICES],
+    /// Per pair (voices 1+2, 3+4): edits to one voice apply to both.
+    linked: [bool; VOICES / 2],
     feedback: [[f32; VOICES]; VOICES],
     selected: usize,
     source: Source,
     drag_from: Option<f32>,
-    /// Result of the last WAV load.
+    /// Result of the last load, save or failure.
     status: String,
     /// Displayed input level, linear, with meter ballistics applied.
     meter: f32,
@@ -150,6 +175,7 @@ struct App {
     sample_seconds: Option<f32>,
     /// Seconds from the buffer start shown on the waveform.
     view_len: f32,
+    saving: Option<PendingSave>,
 }
 
 impl App {
@@ -162,6 +188,15 @@ impl App {
         self.view_len = len.clamp(0.01, self.audio.buffer_seconds);
         let frames = (self.view_len * self.audio.sample_rate) as usize;
         self.audio.meters.set_view_frames(frames);
+    }
+
+    /// Voice `i`, and its partner if the pair is linked.
+    fn targets(&self, i: usize) -> Vec<usize> {
+        if self.linked[i / 2] {
+            vec![i, i ^ 1]
+        } else {
+            vec![i]
+        }
     }
 
     /// Input level in dBFS over [-48, 0]: instant rise, ~300 ms fall.
@@ -188,7 +223,7 @@ impl App {
         resp.on_hover_text(format!("input peak {db:.1} dBFS"));
     }
 
-    /// Load a WAV into the buffer, stop recording, and loop every voice over it.
+    /// Load a WAV into both buffers, stop recording, and loop every voice over it.
     fn load_wav(&mut self, path: &Path) {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let loaded = match wav::load(path, self.audio.sample_rate, BUFFER_FRAMES) {
@@ -199,9 +234,11 @@ impl App {
             }
         };
         let (seconds, truncated, rate) = (loaded.seconds, loaded.truncated, loaded.source_rate);
-        if let Err(e) = self.audio.handle.load(0, loaded.data) {
-            self.status = format!("{name}: {e}");
-            return;
+        for (b, data) in loaded.data.into_iter().enumerate() {
+            if let Err(e) = self.audio.handle.load(b, data) {
+                self.status = format!("{name}: {e}");
+                return;
+            }
         }
         // Loop settings go out with this frame's diff; the cuts go now. Both
         // apply after the load.
@@ -223,6 +260,58 @@ impl App {
         }
     }
 
+    /// Snapshot both buffers over the content length; `collect_returned`
+    /// writes the file once both copies are back.
+    fn start_save(&mut self, path: PathBuf) {
+        if self.saving.is_some() {
+            self.status = "a save is already in progress".into();
+            return;
+        }
+        let frames =
+            ((self.content_seconds() * self.audio.sample_rate) as usize).min(BUFFER_FRAMES);
+        for b in 0..BUFFERS {
+            if let Err(e) = self.audio.handle.snapshot(b, vec![0.0; frames].into()) {
+                self.status = format!("save: {e}");
+                return;
+            }
+        }
+        self.saving = Some(PendingSave {
+            path,
+            parts: [None, None],
+        });
+    }
+
+    /// Take buffers back from the audio thread: snapshots feed a pending save,
+    /// the rest are freed here rather than on the audio thread.
+    fn collect_returned(&mut self) {
+        while let Some(r) = self.audio.handle.returned() {
+            if let Returned::Snapshot { buffer, data } = r
+                && let Some(save) = &mut self.saving
+            {
+                save.parts[buffer] = Some(data);
+            }
+        }
+        if self
+            .saving
+            .as_ref()
+            .is_some_and(|s| s.parts.iter().all(Option::is_some))
+        {
+            let save = self.saving.take().unwrap();
+            let [l, r] = save.parts.map(Option::unwrap);
+            let name = save
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let sr = self.audio.sample_rate;
+            self.status = match wav::save(&save.path, &l, &r, sr as u32) {
+                Ok(()) => format!("saved {name}: {:.1} s", l.len() as f32 / sr),
+                Err(e) => format!("save {name}: {e}"),
+            };
+        }
+    }
+
     fn send(&mut self, cmd: EngineCmd) {
         // A full ring means the audio thread has stalled; the handle counts the
         // drop, and blocking the UI would not help.
@@ -230,54 +319,69 @@ impl App {
     }
 
     fn waveform(&mut self, ui: &mut egui::Ui) {
-        let size = Vec2::new(ui.available_width(), 220.0);
+        let size = Vec2::new(ui.available_width(), 260.0);
         let (resp, painter) = ui.allocate_painter(size, Sense::click_and_drag());
         let rect = resp.rect;
         let len = self.view_len;
         let x_of = |t: f32| rect.left() + t / len * rect.width();
         let t_of = |x: f32| ((x - rect.left()) / rect.width() * len).clamp(0.0, len);
-
-        painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
-        for (i, v) in self.voices.iter().enumerate() {
-            let band = Rect::from_x_y_ranges(x_of(v.loop_start)..=x_of(v.loop_end), rect.y_range());
-            let alpha = if i == self.selected { 60 } else { 22 };
-            painter.rect_filled(band, 0.0, COLORS[i].gamma_multiply_u8(alpha));
-        }
-        let mid = rect.center().y;
-        let bin_w = rect.width() / WAVE_BINS as f32;
+        let lane_h = (rect.height() - 4.0) / BUFFERS as f32;
         let wave = ui.visuals().text_color();
-        for b in 0..WAVE_BINS {
-            let h = self.audio.meters.peak(b).min(1.0) * rect.height() * 0.5;
-            let x = rect.left() + (b as f32 + 0.5) * bin_w;
-            painter.line_segment(
-                [Pos2::new(x, mid - h), Pos2::new(x, mid + h)],
-                Stroke::new(bin_w.max(1.0), wave),
+        let dim = ui.visuals().weak_text_color();
+        let label = egui::FontId::monospace(11.0);
+        let bin_w = rect.width() / WAVE_BINS as f32;
+
+        for b in 0..BUFFERS {
+            let top = rect.top() + b as f32 * (lane_h + 4.0);
+            let lane = Rect::from_x_y_ranges(rect.x_range(), top..=top + lane_h);
+            painter.rect_filled(lane, 4.0, ui.visuals().extreme_bg_color);
+            for (i, v) in self.voices.iter().enumerate() {
+                if v.buffer != b {
+                    continue;
+                }
+                let band =
+                    Rect::from_x_y_ranges(x_of(v.loop_start)..=x_of(v.loop_end), lane.y_range());
+                let alpha = if i == self.selected { 60 } else { 22 };
+                painter.rect_filled(band, 0.0, COLORS[i].gamma_multiply_u8(alpha));
+            }
+            let mid = lane.center().y;
+            for bin in 0..WAVE_BINS {
+                let h = self.audio.meters.peak(b, bin).min(1.0) * lane_h * 0.5;
+                let x = rect.left() + (bin as f32 + 0.5) * bin_w;
+                painter.line_segment(
+                    [Pos2::new(x, mid - h), Pos2::new(x, mid + h)],
+                    Stroke::new(bin_w.max(1.0), wave),
+                );
+            }
+            for i in 0..VOICES {
+                let v = &self.voices[i];
+                if v.buffer != b || (!v.play && !v.rec) {
+                    continue;
+                }
+                let t = self.audio.handle.position(i);
+                if !(0.0..=len).contains(&t) {
+                    continue;
+                }
+                let width = if v.rec { 3.0 } else { 1.5 };
+                painter.vline(x_of(t), lane.y_range(), Stroke::new(width, COLORS[i]));
+            }
+            painter.text(
+                lane.left_top() + Vec2::new(4.0, 2.0),
+                egui::Align2::LEFT_TOP,
+                ["L", "R"][b],
+                label.clone(),
+                dim,
             );
         }
-        for i in 0..VOICES {
-            if !self.voices[i].play && !self.voices[i].rec {
-                continue;
-            }
-            let t = self.audio.handle.position(i);
-            if !(0.0..=len).contains(&t) {
-                continue;
-            }
-            let width = if self.voices[i].rec { 3.0 } else { 1.5 };
-            painter.vline(x_of(t), rect.y_range(), Stroke::new(width, COLORS[i]));
-        }
-
-        let label = egui::FontId::monospace(11.0);
-        let dim = ui.visuals().weak_text_color();
-        let pad = Vec2::new(4.0, -2.0);
         painter.text(
-            rect.left_bottom() + pad,
+            rect.left_bottom() + Vec2::new(4.0, -2.0),
             egui::Align2::LEFT_BOTTOM,
             "0 s",
             label.clone(),
             dim,
         );
         painter.text(
-            rect.right_bottom() + Vec2::new(-pad.x, pad.y),
+            rect.right_bottom() + Vec2::new(-4.0, -2.0),
             egui::Align2::RIGHT_BOTTOM,
             format!("{len:.2} s"),
             label,
@@ -298,7 +402,9 @@ impl App {
                 self.voices[sel].loop_end = t0.max(t);
             }
             if resp.clicked() {
-                self.send(EngineCmd::Voice(sel, VoiceCmd::CutTo(t)));
+                for i in self.targets(sel) {
+                    self.send(EngineCmd::Voice(i, VoiceCmd::CutTo(t)));
+                }
             }
         }
         if resp.drag_stopped() {
@@ -309,19 +415,40 @@ impl App {
     fn voice_controls(&mut self, ui: &mut egui::Ui) {
         let secs = self.content_seconds();
         let i = self.selected;
+        let pair = i / 2;
+        let was_linked = self.linked[pair];
+        ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut self.linked[pair],
+                format!("link voices {} + {}", pair * 2 + 1, pair * 2 + 2),
+            )
+            .on_hover_text(
+                "stereo pair: edits apply to both, on opposite buffers with mirrored pan",
+            );
+        });
+        if self.linked[pair] && !was_linked {
+            self.voices[i ^ 1] = self.voices[i].partner();
+        }
         let v = &mut self.voices[i];
         ui.horizontal(|ui| {
             ui.toggle_value(&mut v.play, "play");
             ui.toggle_value(&mut v.rec, "rec");
             ui.checkbox(&mut v.loop_on, "loop");
+            ui.label("buffer");
+            ui.selectable_value(&mut v.buffer, 0, "L");
+            ui.selectable_value(&mut v.buffer, 1, "R");
         });
-        let mut cut = false;
-        let mut rec_once = false;
+        let (mut cut, mut rec_once, mut clear, mut reverse) = (false, false, false, false);
         ui.horizontal(|ui| {
             cut = ui.button("cut to start").clicked();
             rec_once = ui
                 .button("rec once")
                 .on_hover_text("record one pass of the loop")
+                .clicked();
+            clear = ui.button("clear loop").clicked();
+            reverse = ui
+                .button("reverse loop")
+                .on_hover_text("reverse the loop region of the buffer in place")
                 .clicked();
         });
         egui::Grid::new("voice").num_columns(2).show(ui, |ui| {
@@ -393,12 +520,37 @@ impl App {
                 egui::Slider::new(&mut v.post_dry, 0.0..=1.0),
             );
         });
-        let start = v.loop_start;
-        if cut {
-            self.send(EngineCmd::Voice(i, VoiceCmd::CutTo(start)));
-        }
-        if rec_once {
-            self.send(EngineCmd::Voice(i, VoiceCmd::RecOnce(true)));
+
+        for t in self.targets(i) {
+            let v = self.voices[t];
+            let region = (v.loop_start, v.loop_end - v.loop_start);
+            if cut {
+                self.send(EngineCmd::Voice(t, VoiceCmd::CutTo(v.loop_start)));
+            }
+            if rec_once {
+                self.send(EngineCmd::Voice(t, VoiceCmd::RecOnce(true)));
+            }
+            if clear {
+                self.send(EngineCmd::ClearRegion {
+                    buffer: v.buffer,
+                    start: region.0,
+                    len: region.1,
+                    fade: EDIT_FADE,
+                    preserve: 0.0,
+                });
+            }
+            if reverse {
+                self.send(EngineCmd::CopyRegion {
+                    src: v.buffer,
+                    dst: v.buffer,
+                    src_start: region.0,
+                    dst_start: region.0,
+                    len: region.1,
+                    fade: EDIT_FADE,
+                    preserve: 0.0,
+                    reverse: true,
+                });
+            }
         }
     }
 
@@ -434,8 +586,7 @@ impl eframe::App for App {
         for i in 0..VOICES {
             self.voices[i].rec = self.audio.handle.rec(i);
         }
-        // Replaced buffers come back here to be freed off the audio thread.
-        while self.audio.handle.returned().is_some() {}
+        self.collect_returned();
         let dropped = ui
             .ctx()
             .input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
@@ -446,7 +597,7 @@ impl eframe::App for App {
 
         egui::Panel::left("controls")
             .resizable(false)
-            .default_size(330.0)
+            .default_size(360.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -479,8 +630,10 @@ impl eframe::App for App {
                     self.source = old;
                 }
                 self.input_meter(ui);
-                if ui.button("clear buffer").clicked() {
-                    self.send(EngineCmd::ClearBuffer(0));
+                if ui.button("clear buffers").clicked() {
+                    for b in 0..BUFFERS {
+                        self.send(EngineCmd::ClearBuffer(b));
+                    }
                     self.sample_seconds = None;
                     self.set_view_len(self.audio.buffer_seconds);
                 }
@@ -491,6 +644,17 @@ impl eframe::App for App {
                 {
                     self.load_wav(&path);
                 }
+                if ui
+                    .button("save wav...")
+                    .on_hover_text("save both buffers, over the loaded sample's length, as stereo")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("WAV", &["wav"])
+                        .set_file_name("softcut.wav")
+                        .save_file()
+                {
+                    self.start_save(path);
+                }
                 if let Some(len) = self.sample_seconds
                     && ui.button("fit sample").clicked()
                 {
@@ -499,14 +663,14 @@ impl eframe::App for App {
                 if ui.button("full buffer").clicked() {
                     self.set_view_len(self.audio.buffer_seconds);
                 }
-                ui.label(&self.status);
             });
+            ui.label(&self.status);
             ui.add_space(6.0);
             self.waveform(ui);
             ui.add_space(6.0);
             ui.label(format!(
-                "{} @ {} Hz, buffer {:.1} s. Waveform: click to cut voice {}, drag to set its loop. \
-                 Thick playhead = recording. Drop a WAV on the window to load it.",
+                "{} @ {} Hz, buffers 2 x {:.1} s. Waveform: click to cut voice {}, drag to set its \
+                 loop. Thick playhead = recording. Drop a WAV on the window to load it.",
                 self.audio.output_name,
                 self.audio.sample_rate,
                 self.audio.buffer_seconds,
@@ -514,6 +678,10 @@ impl eframe::App for App {
             ));
         });
 
+        let s = self.selected;
+        if self.linked[s / 2] && self.voices[s] != before[s] {
+            self.voices[s ^ 1] = self.voices[s].partner();
+        }
         let mut cmds = Vec::new();
         for i in 0..VOICES {
             self.voices[i].diff(i, Some(&before[i]), &mut cmds);
@@ -544,6 +712,7 @@ fn main() -> eframe::Result {
     let app = App {
         audio,
         voices,
+        linked: [true; VOICES / 2],
         feedback: [[0.0; VOICES]; VOICES],
         selected: 0,
         source: Source::Off,
@@ -555,9 +724,10 @@ fn main() -> eframe::Result {
         meter: 0.0,
         sample_seconds: None,
         view_len: full,
+        saving: None,
     };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 620.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 680.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -573,39 +743,70 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use softcut::EngineConfig;
 
-    /// The presets play what a load puts in the buffer, and record nothing.
-    #[test]
-    fn presets_play_loaded_content() {
-        let sr = 48000.0;
-        let mut e = Engine::new(EngineConfig {
-            sample_rate: sr,
-            voices: VOICES,
-            buffers: 1,
-            buffer_frames: BUFFER_FRAMES,
-            block_size: 64,
-            out_channels: 2,
-        });
-        for (i, x) in e.buffer_mut(0).iter_mut().enumerate() {
-            *x = 0.5 * (i as f32 * 0.03).sin();
-        }
+    fn preset_engine(sr: f32) -> Engine {
+        let mut e = audio::engine(sr);
         let mut cmds = Vec::new();
         for i in 0..VOICES {
             VoiceUi::preset(i).diff(i, None, &mut cmds);
         }
         cmds.into_iter().for_each(|c| e.apply(c));
+        e
+    }
 
+    /// The presets play what a load puts in the buffers, and record nothing.
+    #[test]
+    fn presets_play_loaded_content() {
+        let sr = 48000.0;
+        let mut e = preset_engine(sr);
+        for b in 0..BUFFERS {
+            for (i, x) in e.buffer_mut(b).iter_mut().enumerate() {
+                *x = 0.5 * (i as f32 * 0.03).sin();
+            }
+        }
         let mut out = [0.0; 1024];
         let mut peak = 0.0f32;
         for _ in 0..(sr as usize / 512) {
-            e.process(&[0.0; 512], &mut out);
+            e.process(&[0.0; 1024], &mut out);
             peak = out.iter().fold(peak, |m, x| m.max(x.abs()));
         }
         assert!(peak > 0.05, "output peak {peak}");
         assert!(
             e.voices().iter().all(|v| !v.rec()),
             "a preset records at startup"
+        );
+    }
+
+    #[test]
+    fn presets_are_stereo_pairs() {
+        for pair in [0, 2] {
+            let (a, b) = (VoiceUi::preset(pair), VoiceUi::preset(pair + 1));
+            assert_eq!((a.buffer, b.buffer), (0, 1));
+            assert_eq!((a.pan, b.pan), (-1.0, 1.0));
+            assert_eq!(b, a.partner());
+            assert_eq!(b.partner(), a);
+        }
+    }
+
+    /// Recording on voices 1+2 puts the left input in buffer L and the right in R.
+    #[test]
+    fn linked_pair_records_stereo_input() {
+        let mut e = preset_engine(48000.0);
+        for i in 0..2 {
+            let old = VoiceUi::preset(i);
+            let new = VoiceUi { rec: true, ..old };
+            let mut cmds = Vec::new();
+            new.diff(i, Some(&old), &mut cmds);
+            cmds.into_iter().for_each(|c| e.apply(c));
+        }
+        let input: Vec<f32> = (0..9600).flat_map(|_| [0.1, -0.2]).collect();
+        let mut out = vec![0.0; 9600 * 2];
+        e.process(&input, &mut out);
+        // Fixed quirks keep polarity; soft clip gain is 1.2 below the knee.
+        let (l, r) = (e.buffers()[0][8000], e.buffers()[1][8000]);
+        assert!(
+            (l - 0.12).abs() < 1e-2 && (r + 0.24).abs() < 1e-2,
+            "L {l}, R {r}"
         );
     }
 }

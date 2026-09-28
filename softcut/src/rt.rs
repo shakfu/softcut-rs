@@ -1,11 +1,12 @@
 //! Cross-thread control of an [`Engine`] (feature `rtrb`).
 //!
 //! [`split`] divides an engine into a [`Handle`] for the control thread and a
-//! [`Processor`] for the audio thread. Commands and buffer loads travel over
-//! one wait-free SPSC ring, so they apply in the order they were sent, at the
-//! start of the next [`Processor::process`] call. Head positions and rec/play
-//! flags come back through atomics, published once per call. Replaced buffers
-//! come back over a second ring, so the audio thread never frees memory.
+//! [`Processor`] for the audio thread. Commands and buffer transfers (load,
+//! write, snapshot) travel over one wait-free SPSC ring, so they apply in the
+//! order they were sent, at the start of the next [`Processor::process`] call.
+//! Head positions and rec/play flags come back through atomics, published once
+//! per call. Every buffer sent comes back over a second ring as a
+//! [`Returned`], so the audio thread never frees memory.
 //!
 //! The ring has one producer. Hosts with several control sources must
 //! serialize them onto the one `Handle`.
@@ -16,11 +17,59 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::{Engine, EngineCmd};
+use crate::{Engine, EngineCmd, buffer};
 
 enum Msg {
     Cmd(EngineCmd),
     Load(usize, Box<[f32]>),
+    Write {
+        buffer: usize,
+        start: f32,
+        data: Box<[f32]>,
+        preserve: f32,
+        mix: f32,
+        fade: f32,
+    },
+    Snapshot(usize, Box<[f32]>),
+}
+
+impl Msg {
+    fn into_data(self) -> Option<Box<[f32]>> {
+        match self {
+            Msg::Cmd(_) => None,
+            Msg::Load(_, d) | Msg::Write { data: d, .. } | Msg::Snapshot(_, d) => Some(d),
+        }
+    }
+}
+
+/// A buffer coming back from the audio thread.
+#[derive(Debug, PartialEq)]
+pub enum Returned {
+    /// What `buffer` held before a [`Handle::load`] replaced it.
+    Replaced { buffer: usize, data: Box<[f32]> },
+    /// The data passed to [`Handle::write`], after it was written.
+    Written { buffer: usize, data: Box<[f32]> },
+    /// The buffer passed to [`Handle::snapshot`], holding a copy of the first
+    /// `min(data.len(), buffer length)` frames of `buffer`.
+    Snapshot { buffer: usize, data: Box<[f32]> },
+}
+
+impl Returned {
+    pub fn buffer(&self) -> usize {
+        match self {
+            Returned::Replaced { buffer, .. }
+            | Returned::Written { buffer, .. }
+            | Returned::Snapshot { buffer, .. } => *buffer,
+        }
+    }
+
+    pub fn into_data(self) -> Box<[f32]> {
+        match self {
+            Returned::Replaced { data, .. }
+            | Returned::Written { data, .. }
+            | Returned::Snapshot { data, .. } => data,
+        }
+    }
 }
 
 struct Shared {
@@ -32,7 +81,7 @@ struct Shared {
 
 /// Returns the control half and the audio half of `engine`. `capacity` is the
 /// number of messages that can be queued between two `process` calls, and
-/// the number of replaced buffers that can wait for [`Handle::returned`].
+/// the number of buffers that can wait for [`Handle::returned`].
 pub fn split(engine: Engine, capacity: usize) -> (Handle, Processor) {
     let n = engine.voices().len();
     let buffers = engine.buffers().len();
@@ -72,34 +121,34 @@ impl fmt::Display for Full {
 
 impl std::error::Error for Full {}
 
-/// Why [`Handle::load`] refused a buffer.
+/// Why [`Handle::load`], [`Handle::write`] or [`Handle::snapshot`] refused a buffer.
 #[derive(Debug, PartialEq)]
-pub enum LoadError {
+pub enum BufferError {
     /// No buffer has this index.
     NoSuchBuffer(usize),
-    /// The length, which is not a power of two.
+    /// The length, which is not a power of two ([`Handle::load`] only).
     NotPowerOfTwo(usize),
     /// The ring was full; the data is returned for a later retry.
     Full(Box<[f32]>),
 }
 
-impl fmt::Display for LoadError {
+impl fmt::Display for BufferError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LoadError::NoSuchBuffer(i) => write!(f, "no softcut buffer {i}"),
-            LoadError::NotPowerOfTwo(n) => write!(f, "buffer length {n} is not a power of two"),
-            LoadError::Full(_) => write!(f, "softcut command ring full"),
+            BufferError::NoSuchBuffer(i) => write!(f, "no softcut buffer {i}"),
+            BufferError::NotPowerOfTwo(n) => write!(f, "buffer length {n} is not a power of two"),
+            BufferError::Full(_) => write!(f, "softcut command ring full"),
         }
     }
 }
 
-impl std::error::Error for LoadError {}
+impl std::error::Error for BufferError {}
 
 /// Control-thread half: sends commands and buffers, reads published state.
 /// Never blocks.
 pub struct Handle {
     tx: Producer<Msg>,
-    returned: Consumer<(usize, Box<[f32]>)>,
+    returned: Consumer<Returned>,
     shared: Arc<Shared>,
     buffers: usize,
     dropped: u64,
@@ -123,32 +172,72 @@ impl Handle {
     ///
     /// The length may differ from the current buffer's but must be a power of
     /// two. The old buffer comes back through [`returned`](Self::returned).
-    pub fn load(&mut self, buffer: usize, data: Box<[f32]>) -> Result<(), LoadError> {
+    pub fn load(&mut self, buffer: usize, data: Box<[f32]>) -> Result<(), BufferError> {
         if buffer >= self.buffers {
-            return Err(LoadError::NoSuchBuffer(buffer));
+            return Err(BufferError::NoSuchBuffer(buffer));
         }
         if !data.len().is_power_of_two() {
-            return Err(LoadError::NotPowerOfTwo(data.len()));
+            return Err(BufferError::NotPowerOfTwo(data.len()));
         }
-        self.tx.push(Msg::Load(buffer, data)).map_err(|e| {
-            self.dropped += 1;
-            match e {
-                rtrb::PushError::Full(Msg::Load(_, data)) => LoadError::Full(data),
-                rtrb::PushError::Full(Msg::Cmd(_)) => unreachable!(),
-            }
+        self.push(Msg::Load(buffer, data))
+    }
+
+    /// Queue a blended write of `data` into `buffer` at `start` seconds, as in
+    /// [`buffer::write`] with `fade` in seconds. With `preserve = 0, mix = 1`,
+    /// an overwrite: norns `buffer_read`, with the file decoded by the caller.
+    /// `data` comes back as [`Returned::Written`].
+    pub fn write(
+        &mut self,
+        buffer: usize,
+        start: f32,
+        data: Box<[f32]>,
+        preserve: f32,
+        mix: f32,
+        fade: f32,
+    ) -> Result<(), BufferError> {
+        if buffer >= self.buffers {
+            return Err(BufferError::NoSuchBuffer(buffer));
+        }
+        self.push(Msg::Write {
+            buffer,
+            start,
+            data,
+            preserve,
+            mix,
+            fade,
         })
     }
 
-    /// Next replaced buffer and its index, oldest first.
+    /// Queue a copy of `buffer` into `dest`, taken between two blocks, so it
+    /// is consistent even while voices record. `dest` comes back as
+    /// [`Returned::Snapshot`]. The copy costs one memcpy on the audio thread.
+    pub fn snapshot(&mut self, buffer: usize, dest: Box<[f32]>) -> Result<(), BufferError> {
+        if buffer >= self.buffers {
+            return Err(BufferError::NoSuchBuffer(buffer));
+        }
+        self.push(Msg::Snapshot(buffer, dest))
+    }
+
+    fn push(&mut self, msg: Msg) -> Result<(), BufferError> {
+        self.tx.push(msg).map_err(|rtrb::PushError::Full(msg)| {
+            self.dropped += 1;
+            BufferError::Full(
+                msg.into_data()
+                    .expect("only buffer messages are pushed here"),
+            )
+        })
+    }
+
+    /// Next buffer back from the audio thread, oldest first.
     ///
     /// Drain this regularly. While `capacity` buffers wait here, the processor
-    /// holds further loads, and everything queued after them, rather than free
-    /// memory on the audio thread.
-    pub fn returned(&mut self) -> Option<(usize, Box<[f32]>)> {
+    /// holds further buffer messages, and everything queued after them, rather
+    /// than free memory on the audio thread.
+    pub fn returned(&mut self) -> Option<Returned> {
         self.returned.pop().ok()
     }
 
-    /// Commands and loads refused because the ring was full.
+    /// Commands and buffer messages refused because the ring was full.
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
@@ -179,7 +268,7 @@ impl Handle {
 pub struct Processor {
     engine: Engine,
     rx: Consumer<Msg>,
-    spent: Producer<(usize, Box<[f32]>)>,
+    spent: Producer<Returned>,
     shared: Arc<Shared>,
 }
 
@@ -188,21 +277,51 @@ impl Processor {
     /// [`Engine::process`].
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) {
         while let Ok(msg) = self.rx.peek() {
-            // A load needs somewhere to put the old buffer; without it, stop
-            // here and keep the queue's order.
-            if matches!(msg, Msg::Load(..)) && self.spent.is_full() {
+            // A buffer message needs somewhere to send its buffer back;
+            // without it, stop here and keep the queue's order.
+            if !matches!(msg, Msg::Cmd(_)) && self.spent.is_full() {
                 break;
             }
-            match self.rx.pop() {
-                Ok(Msg::Cmd(cmd)) => self.engine.apply(cmd),
-                Ok(Msg::Load(i, data)) => {
-                    // `Handle::load` validated both index and length.
-                    if let Ok(old) = self.engine.replace_buffer(i, data) {
-                        let _ = self.spent.push((i, old));
-                    }
+            let Ok(msg) = self.rx.pop() else { break };
+            // The handle validated indices and lengths, so none of these fail.
+            let back = match msg {
+                Msg::Cmd(cmd) => {
+                    self.engine.apply(cmd);
+                    continue;
                 }
-                Err(_) => break,
-            }
+                Msg::Load(buffer, data) => {
+                    let (Ok(data) | Err(data)) = self.engine.replace_buffer(buffer, data);
+                    Returned::Replaced { buffer, data }
+                }
+                Msg::Write {
+                    buffer,
+                    start,
+                    data,
+                    preserve,
+                    mix,
+                    fade,
+                } => {
+                    let sr = self.engine.sample_rate();
+                    let frames = |t: f32| (t * sr).round().max(0.0) as usize;
+                    let (start, fade) = (frames(start), frames(fade));
+                    buffer::write(
+                        self.engine.buffer_mut(buffer),
+                        start,
+                        &data,
+                        preserve,
+                        mix,
+                        fade,
+                    );
+                    Returned::Written { buffer, data }
+                }
+                Msg::Snapshot(buffer, mut data) => {
+                    let src = &self.engine.buffers()[buffer];
+                    let n = src.len().min(data.len());
+                    data[..n].copy_from_slice(&src[..n]);
+                    Returned::Snapshot { buffer, data }
+                }
+            };
+            let _ = self.spent.push(back);
         }
         self.engine.process(input, output);
         self.publish();
@@ -312,16 +431,28 @@ mod tests {
         let b = &p.engine().buffers()[0];
         assert_eq!(b.len(), 1 << 10);
         assert!(b.iter().all(|&x| x == 0.0));
-        let (i, old) = h.returned().unwrap();
-        assert_eq!((i, old.len()), (0, 1 << 14));
+        let back = h.returned().unwrap();
+        assert!(matches!(back, Returned::Replaced { buffer: 0, .. }));
+        assert_eq!(back.into_data().len(), 1 << 14);
         assert!(h.returned().is_none());
     }
 
     #[test]
     fn load_is_validated_on_the_control_thread() {
         let (mut h, _p) = split(engine(), 16);
-        assert_eq!(h.load(1, buf(8, 0.0)), Err(LoadError::NoSuchBuffer(1)));
-        assert_eq!(h.load(0, buf(100, 0.0)), Err(LoadError::NotPowerOfTwo(100)));
+        assert_eq!(h.load(1, buf(8, 0.0)), Err(BufferError::NoSuchBuffer(1)));
+        assert_eq!(
+            h.write(1, 0.0, buf(8, 0.0), 0.0, 1.0, 0.0),
+            Err(BufferError::NoSuchBuffer(1))
+        );
+        assert_eq!(
+            h.snapshot(1, buf(8, 0.0)),
+            Err(BufferError::NoSuchBuffer(1))
+        );
+        assert_eq!(
+            h.load(0, buf(100, 0.0)),
+            Err(BufferError::NotPowerOfTwo(100))
+        );
         assert_eq!(h.dropped(), 0);
     }
 
@@ -341,10 +472,10 @@ mod tests {
         );
         assert!(matches!(h.send(EngineCmd::ClearBuffer(0)), Err(Full(_))));
 
-        assert_eq!(h.returned().unwrap().1.len(), 1 << 14);
+        assert_eq!(h.returned().unwrap().into_data().len(), 1 << 14);
         p.process(&[0.0; 64], &mut out);
         assert_eq!(p.engine().buffers()[0].len(), 16);
-        assert_eq!(h.returned().unwrap().1.len(), 8);
+        assert_eq!(h.returned().unwrap().into_data().len(), 8);
     }
 
     #[test]
@@ -352,9 +483,52 @@ mod tests {
         let (mut h, _p) = split(engine(), 1);
         h.send(EngineCmd::Level(0, 1.0)).unwrap();
         match h.load(0, buf(8, 3.0)) {
-            Err(LoadError::Full(d)) => assert_eq!(d.len(), 8),
+            Err(BufferError::Full(d)) => assert_eq!(d.len(), 8),
             other => panic!("{other:?}"),
         }
         assert_eq!(h.dropped(), 1);
+    }
+
+    #[test]
+    fn write_and_snapshot_round_trip_in_order() {
+        let (mut h, mut p) = split(engine(), 16);
+        let sr = p.engine().sample_rate();
+        // Write 0.5 at 0.01 s, then snapshot, then clear: the snapshot must
+        // see the write and not the clear.
+        h.write(0, 0.01, buf(100, 0.5), 0.0, 1.0, 0.0).unwrap();
+        h.snapshot(0, buf(1 << 14, -1.0)).unwrap();
+        h.send(EngineCmd::ClearBuffer(0)).unwrap();
+        let mut out = [0.0; 64 * 2];
+        p.process(&[0.0; 64], &mut out);
+
+        let start = (0.01 * sr) as usize;
+        match h.returned().unwrap() {
+            Returned::Written { buffer: 0, data } => assert_eq!(data.len(), 100),
+            other => panic!("{other:?}"),
+        }
+        let snap = match h.returned().unwrap() {
+            Returned::Snapshot { buffer: 0, data } => data,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            (
+                snap[start - 1],
+                snap[start],
+                snap[start + 99],
+                snap[start + 100]
+            ),
+            (0.0, 0.5, 0.5, 0.0)
+        );
+        assert!(p.engine().buffers()[0].iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn short_snapshot_copies_a_prefix() {
+        let (mut h, mut p) = split(engine(), 16);
+        p.engine_mut().buffer_mut(0).fill(0.25);
+        h.snapshot(0, buf(10, 0.0)).unwrap();
+        let mut out = [0.0; 64 * 2];
+        p.process(&[0.0; 64], &mut out);
+        assert_eq!(*h.returned().unwrap().into_data(), [0.25; 10]);
     }
 }

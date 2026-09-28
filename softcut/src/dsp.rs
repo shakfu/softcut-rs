@@ -32,6 +32,7 @@ pub(crate) fn fsign(x: f32) -> f32 {
     if x > 0.0 { 1.0 } else { -1.0 }
 }
 
+use crate::Quirks;
 const FADE_BUF_SIZE: usize = 1001;
 const FPI: f32 = std::f32::consts::PI;
 
@@ -46,18 +47,22 @@ pub(crate) struct FadeCurves {
 }
 
 impl FadeCurves {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(quirks: Quirks) -> Self {
         let n = FADE_BUF_SIZE - 1;
 
         // Rec curve, "raised" shape. NB: upstream computes `-sin(x)`, so the
         // curve runs 0 -> -1 and recorded material is polarity-inverted.
+        let sign = match quirks {
+            Quirks::Upstream => -1.0,
+            Quirks::Fixed => 1.0,
+        };
         let mut rec = [0.0f32; FADE_BUF_SIZE];
         let ndr = ((1.0f32 / 128.0) * FADE_BUF_SIZE as f32) as usize;
         let nr = n - ndr;
         let phi = FPI / (nr * 2) as f32;
         let mut x = 0.0f32;
         for v in &mut rec[ndr..n] {
-            *v = -x.sin();
+            *v = sign * x.sin();
             x += phi;
         }
         rec[n] = 1.0;
@@ -190,11 +195,13 @@ mod tests {
 
     #[test]
     fn fade_curves_endpoints() {
-        let c = FadeCurves::new();
+        let c = FadeCurves::new(Quirks::Upstream);
         assert_eq!(c.pre_value(0.0), 1.0);
         assert_eq!(c.pre_value(1.0), 0.0);
         assert_eq!(c.rec_value(0.0), 0.0);
         assert!((c.rec_value(1.0) + 1.0).abs() < 1e-3);
+        let fixed = FadeCurves::new(Quirks::Fixed);
+        assert!((fixed.rec_value(1.0) - 1.0).abs() < 1e-3);
     }
 
     #[test]

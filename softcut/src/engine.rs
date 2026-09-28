@@ -2,10 +2,12 @@
 //!
 //! Port of softcut-py's `shared/mixer.hpp`: per-voice input gain, a
 //! voice-to-voice feedback matrix delayed by one block, and equal-power pan.
+//! Adds multichannel input with a channel-to-voice level matrix, as on norns.
 //! Allocates only in [`Engine::new`]; [`Engine::process`] and
 //! [`Engine::apply`] are realtime-safe.
 
-use crate::voice::{Voice, VoiceCmd};
+use crate::buffer;
+use crate::voice::{Quirks, Voice, VoiceCmd};
 
 /// An engine-level change, for hosts that queue changes to the audio thread.
 /// Out-of-range indices are ignored.
@@ -14,7 +16,14 @@ pub enum EngineCmd {
     Voice(usize, VoiceCmd),
     Level(usize, f32),
     Pan(usize, f32),
+    /// Gain applied to all of a voice's input, after the channel levels.
     InputGain(usize, f32),
+    /// Level of input `channel` into `voice` (norns `level_input_cut`).
+    InputLevel {
+        channel: usize,
+        voice: usize,
+        amount: f32,
+    },
     Feedback {
         src: usize,
         dst: usize,
@@ -29,6 +38,29 @@ pub enum EngineCmd {
         lead: usize,
         offset: f32,
     },
+    /// Scale a region by `preserve` (0 silences it), fading over `fade`
+    /// seconds at each edge. Times in seconds; a negative `len` runs to the
+    /// end. See [`buffer::clear`].
+    ClearRegion {
+        buffer: usize,
+        start: f32,
+        len: f32,
+        fade: f32,
+        preserve: f32,
+    },
+    /// Copy a region between or within buffers, blended as in
+    /// [`buffer::copy`]. A reversed copy between partly overlapping regions of
+    /// one buffer is ignored; see [`buffer::copy_within`].
+    CopyRegion {
+        src: usize,
+        dst: usize,
+        src_start: f32,
+        dst_start: f32,
+        len: f32,
+        fade: f32,
+        preserve: f32,
+        reverse: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,7 +72,11 @@ pub struct EngineConfig {
     pub buffer_frames: usize,
     /// Feedback latency, and the largest chunk processed at once.
     pub block_size: usize,
+    /// Interleaved input channels. Voice `v` initially listens to channel
+    /// `v % in_channels` at level 1.
+    pub in_channels: usize,
     pub out_channels: usize,
+    pub quirks: Quirks,
 }
 
 impl Default for EngineConfig {
@@ -52,7 +88,9 @@ impl Default for EngineConfig {
             buffers: 2,
             buffer_frames: 1 << 24,
             block_size: 128,
+            in_channels: 1,
             out_channels: 2,
+            quirks: Quirks::Upstream,
         }
     }
 }
@@ -86,7 +124,11 @@ pub struct Engine {
     buffers: Vec<Box<[f32]>>,
     /// `fb[src * n + dst]`
     fb: Vec<f32>,
+    /// `in_level[channel * n + voice]`
+    in_level: Vec<f32>,
+    sample_rate: f32,
     block_size: usize,
+    in_channels: usize,
     out_channels: usize,
     voice_in: Vec<f32>,
     prev_out: Vec<f32>,
@@ -95,26 +137,35 @@ pub struct Engine {
 
 impl Engine {
     /// # Panics
-    /// If `voices`, `buffers`, `block_size` or `out_channels` is zero.
+    /// If `voices`, `buffers`, `block_size`, `in_channels` or `out_channels`
+    /// is zero.
     pub fn new(cfg: EngineConfig) -> Self {
         assert!(
             cfg.voices > 0 && cfg.buffers > 0,
             "need at least one voice and one buffer"
         );
         assert!(
-            cfg.block_size > 0 && cfg.out_channels > 0,
-            "block_size and out_channels must be > 0"
+            cfg.block_size > 0 && cfg.in_channels > 0 && cfg.out_channels > 0,
+            "block_size, in_channels and out_channels must be > 0"
         );
         let frames = cfg.buffer_frames.max(1).next_power_of_two();
-        let n = cfg.voices;
+        let (n, ic) = (cfg.voices, cfg.in_channels);
+        let in_level = (0..ic * n)
+            .map(|k| if (k % n) % ic == k / n { 1.0 } else { 0.0 })
+            .collect();
         Self {
-            voices: (0..n).map(|_| Voice::new(cfg.sample_rate)).collect(),
+            voices: (0..n)
+                .map(|_| Voice::with_quirks(cfg.sample_rate, cfg.quirks))
+                .collect(),
             mix: vec![VoiceMix::default(); n],
             buffers: (0..cfg.buffers)
                 .map(|_| vec![0.0; frames].into_boxed_slice())
                 .collect(),
             fb: vec![0.0; n * n],
+            in_level,
+            sample_rate: cfg.sample_rate,
             block_size: cfg.block_size,
+            in_channels: ic,
             out_channels: cfg.out_channels,
             voice_in: vec![0.0; cfg.block_size],
             prev_out: vec![0.0; n * cfg.block_size],
@@ -122,39 +173,54 @@ impl Engine {
         }
     }
 
-    /// Process mono `input` into interleaved `output` of
-    /// `input.len() * out_channels` samples.
+    /// Process interleaved `input` of `in_channels` into interleaved `output`
+    /// of `out_channels`, frame for frame.
     ///
     /// # Panics
-    /// If `output` has the wrong length.
+    /// If `input` is not whole frames, or `output` has a different frame count.
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) {
-        let ch = self.out_channels;
+        let (ic, oc) = (self.in_channels, self.out_channels);
+        assert_eq!(
+            input.len() % ic,
+            0,
+            "input must be whole frames of in_channels"
+        );
         assert_eq!(
             output.len(),
-            input.len() * ch,
-            "output must hold input.len() * out_channels samples"
+            input.len() / ic * oc,
+            "output must hold as many frames as input"
         );
         for (cin, cout) in input
-            .chunks(self.block_size)
-            .zip(output.chunks_mut(self.block_size * ch))
+            .chunks(self.block_size * ic)
+            .zip(output.chunks_mut(self.block_size * oc))
         {
             self.process_chunk(cin, cout);
         }
     }
 
     fn process_chunk(&mut self, input: &[f32], out: &mut [f32]) {
-        let (n, bs, ch, frames) = (
+        let (n, bs, ic, ch) = (
             self.voices.len(),
             self.block_size,
+            self.in_channels,
             self.out_channels,
-            input.len(),
         );
+        let frames = input.len() / ic;
         out.fill(0.0);
         let voice_in = &mut self.voice_in[..frames];
         for dst in 0..n {
             let m = self.mix[dst];
-            for (vi, &x) in voice_in.iter_mut().zip(input) {
-                *vi = x * m.input_gain;
+            voice_in.fill(0.0);
+            for c in 0..ic {
+                let g = self.in_level[c * n + dst];
+                if g != 0.0 {
+                    for (vi, frame) in voice_in.iter_mut().zip(input.chunks_exact(ic)) {
+                        *vi += frame[c] * g;
+                    }
+                }
+            }
+            for vi in voice_in.iter_mut() {
+                *vi *= m.input_gain;
             }
             for src in 0..n {
                 let g = self.fb[src * n + dst];
@@ -203,6 +269,15 @@ impl Engine {
                     m.input_gain = x;
                 }
             }
+            EngineCmd::InputLevel {
+                channel,
+                voice,
+                amount,
+            } => {
+                if channel < self.in_channels && voice < n {
+                    self.in_level[channel * n + voice] = amount;
+                }
+            }
             EngineCmd::Feedback { src, dst, amount } => {
                 if src < n && dst < n {
                     self.fb[src * n + dst] = amount;
@@ -230,7 +305,57 @@ impl Engine {
                     self.voices[follow].cut_to(pos);
                 }
             }
+            EngineCmd::ClearRegion {
+                buffer,
+                start,
+                len,
+                fade,
+                preserve,
+            } => {
+                let (start, fade) = (self.frames(start), self.frames(fade));
+                let len = if len < 0.0 {
+                    usize::MAX
+                } else {
+                    self.frames(len)
+                };
+                if let Some(buf) = self.buffers.get_mut(buffer) {
+                    buffer::clear(buf, start, len, preserve, fade);
+                }
+            }
+            EngineCmd::CopyRegion {
+                src,
+                dst,
+                src_start,
+                dst_start,
+                len,
+                fade,
+                preserve,
+                reverse,
+            } => {
+                let (ss, ds, fade) = (
+                    self.frames(src_start),
+                    self.frames(dst_start),
+                    self.frames(fade),
+                );
+                let len = if len < 0.0 {
+                    usize::MAX
+                } else {
+                    self.frames(len)
+                };
+                if src == dst {
+                    if let Some(buf) = self.buffers.get_mut(src) {
+                        buffer::copy_within(buf, ss, ds, len, preserve, fade, reverse);
+                    }
+                } else if let Ok([s, d]) = self.buffers.get_disjoint_mut([src, dst]) {
+                    buffer::copy(s, d, ss, ds, len, preserve, fade, reverse);
+                }
+            }
         }
+    }
+
+    /// Seconds to frames, rounded; negative times clamp to 0.
+    fn frames(&self, sec: f32) -> usize {
+        (sec * self.sample_rate).round().max(0.0) as usize
     }
 
     pub fn voices(&self) -> &[Voice] {
@@ -243,6 +368,10 @@ impl Engine {
 
     pub fn mix(&self, i: usize) -> VoiceMix {
         self.mix[i]
+    }
+
+    pub fn input_level(&self, channel: usize, voice: usize) -> f32 {
+        self.in_level[channel * self.voices.len() + voice]
     }
 
     pub fn feedback(&self, src: usize, dst: usize) -> f32 {
@@ -270,6 +399,14 @@ impl Engine {
             Some(slot) if buf.len().is_power_of_two() => Ok(std::mem::replace(slot, buf)),
             _ => Err(buf),
         }
+    }
+
+    pub fn in_channels(&self) -> usize {
+        self.in_channels
+    }
+
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
     }
 
     pub fn out_channels(&self) -> usize {
@@ -361,6 +498,139 @@ mod tests {
         let mut out = vec![0.0; 4096 * 2];
         e.process(&[0.0; 4096], &mut out);
         assert!(out[8000].abs() > 0.1);
+    }
+
+    fn record_all(e: &mut Engine) {
+        for v in 0..e.voices().len() {
+            for c in [
+                VoiceCmd::LoopEnd(0.5),
+                VoiceCmd::Loop(true),
+                VoiceCmd::RecLevel(1.0),
+                VoiceCmd::Rec(true),
+            ] {
+                e.apply(EngineCmd::Voice(v, c));
+            }
+        }
+    }
+
+    #[test]
+    fn stereo_input_routes_channel_per_voice() {
+        let mut e = Engine::new(EngineConfig {
+            voices: 2,
+            buffers: 2,
+            buffer_frames: 1 << 15,
+            block_size: 64,
+            in_channels: 2,
+            quirks: Quirks::Fixed,
+            ..Default::default()
+        });
+        e.apply(EngineCmd::VoiceBuffer(1, 1));
+        record_all(&mut e);
+        // L = 0.1, R = 0.2, interleaved; voice 0 hears L, voice 1 hears R.
+        let input: Vec<f32> = (0..4800).flat_map(|_| [0.1, 0.2]).collect();
+        let mut out = vec![0.0; 4800 * 2];
+        e.process(&input, &mut out);
+        // Soft clip gain 1.2 below the knee.
+        assert!(
+            (e.buffers()[0][3000] - 0.12).abs() < 1e-3,
+            "{}",
+            e.buffers()[0][3000]
+        );
+        assert!(
+            (e.buffers()[1][3000] - 0.24).abs() < 1e-3,
+            "{}",
+            e.buffers()[1][3000]
+        );
+
+        // Route both channels into voice 0 at half level.
+        e.apply(EngineCmd::InputLevel {
+            channel: 0,
+            voice: 0,
+            amount: 0.5,
+        });
+        e.apply(EngineCmd::InputLevel {
+            channel: 1,
+            voice: 0,
+            amount: 0.5,
+        });
+        assert_eq!((e.input_level(0, 0), e.input_level(1, 0)), (0.5, 0.5));
+        assert_eq!((e.input_level(0, 1), e.input_level(1, 1)), (0.0, 1.0));
+    }
+
+    #[test]
+    fn engine_quirks_reach_every_voice() {
+        let e = Engine::new(EngineConfig {
+            voices: 3,
+            buffers: 1,
+            buffer_frames: 1 << 10,
+            quirks: Quirks::Fixed,
+            ..Default::default()
+        });
+        assert!(e.voices().iter().all(|v| v.quirks() == Quirks::Fixed));
+    }
+
+    #[test]
+    fn region_commands_use_seconds() {
+        let mut e = Engine::new(EngineConfig {
+            sample_rate: 1000.0,
+            voices: 1,
+            buffers: 2,
+            buffer_frames: 1 << 12,
+            ..Default::default()
+        });
+        for (i, x) in e.buffer_mut(0).iter_mut().enumerate() {
+            *x = i as f32;
+        }
+        e.apply(EngineCmd::ClearRegion {
+            buffer: 0,
+            start: 1.0,
+            len: 0.5,
+            fade: 0.0,
+            preserve: 0.0,
+        });
+        let b = &e.buffers()[0];
+        assert_eq!(
+            (b[999], b[1000], b[1499], b[1500]),
+            (999.0, 0.0, 0.0, 1500.0)
+        );
+
+        // Reverse 0.1 s from buffer 0 at 2 s into buffer 1 at 0.5 s.
+        e.apply(EngineCmd::CopyRegion {
+            src: 0,
+            dst: 1,
+            src_start: 2.0,
+            dst_start: 0.5,
+            len: 0.1,
+            fade: 0.0,
+            preserve: 0.0,
+            reverse: true,
+        });
+        let b = &e.buffers()[1];
+        assert_eq!((b[499], b[500], b[599], b[600]), (0.0, 2099.0, 2000.0, 0.0));
+
+        // Reverse in place within one buffer.
+        e.apply(EngineCmd::CopyRegion {
+            src: 0,
+            dst: 0,
+            src_start: 3.0,
+            dst_start: 3.0,
+            len: 0.01,
+            fade: 0.0,
+            preserve: 0.0,
+            reverse: true,
+        });
+        let b = &e.buffers()[0];
+        assert_eq!((b[3000], b[3009]), (3009.0, 3000.0));
+
+        // A negative length clears to the end.
+        e.apply(EngineCmd::ClearRegion {
+            buffer: 0,
+            start: 4.0,
+            len: -1.0,
+            fade: 0.0,
+            preserve: 0.0,
+        });
+        assert!(e.buffers()[0][4000..].iter().all(|&x| x == 0.0));
     }
 
     #[test]

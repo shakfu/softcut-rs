@@ -192,10 +192,10 @@ pub(crate) struct ReadWriteHead {
 }
 
 impl ReadWriteHead {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(quirks: crate::Quirks) -> Self {
         let mut h = Self {
             head: [SubHead::new(), SubHead::new()],
-            curves: FadeCurves::new(),
+            curves: FadeCurves::new(quirks),
             sr: 48000.0,
             start: 0.0,
             end: 0.0,

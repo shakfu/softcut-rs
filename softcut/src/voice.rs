@@ -43,6 +43,18 @@ pub enum VoiceCmd {
     Reset,
 }
 
+/// Which upstream softcut-lib behaviours a voice reproduces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Quirks {
+    /// Match softcut-lib sample for sample: recorded material is
+    /// polarity-inverted, and `reset` leaves a 0.1 s fade time.
+    #[default]
+    Upstream,
+    /// Record with the input's polarity, and leave the 0.01 s fade time that
+    /// `reset` sets.
+    Fixed,
+}
+
 /// A crossfading, resampling read/write head over a caller-owned buffer, with
 /// pre (input) and post (output) state-variable filters.
 ///
@@ -68,13 +80,19 @@ pub struct Voice {
     quant_phase: f64,
     play: bool,
     rec: bool,
+    quirks: Quirks,
 }
 
 impl Voice {
+    /// A voice that reproduces upstream behaviour ([`Quirks::Upstream`]).
     pub fn new(sample_rate: f32) -> Self {
+        Self::with_quirks(sample_rate, Quirks::Upstream)
+    }
+
+    pub fn with_quirks(sample_rate: f32, quirks: Quirks) -> Self {
         let mut v = Self {
             sample_rate: 48000.0,
-            head: ReadWriteHead::new(),
+            head: ReadWriteHead::new(quirks),
             svf_pre: Svf::new(),
             svf_post: Svf::new(),
             rate_ramp: LogRamp::new(48000.0, 0.1),
@@ -90,6 +108,7 @@ impl Voice {
             quant_phase: 0.0,
             play: false,
             rec: false,
+            quirks,
         };
         v.reset();
         v.set_sample_rate(sample_rate);
@@ -99,8 +118,8 @@ impl Voice {
     /// Restore defaults and stop both subheads. Keeps the sample rate, loop
     /// flag and the pre-filter base cutoff, as upstream does.
     ///
-    /// The effective fade time after reset is 0.1 s: upstream sets 0.01 s and
-    /// then the head's own init overrides it.
+    /// With [`Quirks::Upstream`] the fade time after reset is 0.1 s: upstream
+    /// sets 0.01 s and then the head's own init overrides it.
     pub fn reset(&mut self) {
         self.svf_pre.clear_state();
         self.svf_pre.set_lp_mix(1.0);
@@ -139,6 +158,9 @@ impl Voice {
         self.play = false;
 
         self.head.init();
+        if self.quirks == Quirks::Fixed {
+            self.set_fade_time(0.01);
+        }
     }
 
     /// Process one mono block. `buf` is the audio buffer the heads read and
@@ -515,6 +537,10 @@ impl Voice {
         self.quant_phase
     }
 
+    pub fn quirks(&self) -> Quirks {
+        self.quirks
+    }
+
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
     }
@@ -682,6 +708,29 @@ mod tests {
         assert!(v.looping() && v.play() && v.rec() && v.rec_once());
         // Stored as whole samples: -0.001 s at 44.1 kHz is -44 samples.
         assert_eq!(v.rec_offset(), -44.0 / 44100.0);
+    }
+
+    #[test]
+    fn fixed_quirks_record_with_input_polarity_and_keep_short_fade() {
+        for (quirks, sign, fade) in [(Quirks::Upstream, -1.0, 0.1), (Quirks::Fixed, 1.0, 0.01)] {
+            let mut v = Voice::with_quirks(48000.0, quirks);
+            assert_eq!(v.fade_time(), fade, "{quirks:?} after new");
+            let mut buf = vec![0.0; 1 << 14];
+            v.set_loop_end(0.2);
+            v.set_loop(true);
+            v.set_rec_level(1.0);
+            v.set_rec(true);
+            v.set_play(true);
+            v.cut_to(0.0);
+            let mut out = [0.0; 9000];
+            v.process_block(&mut buf, &[0.25; 9000], &mut out);
+            // Past the upstream 0.1 s crossfade, where only one head writes.
+            // Soft clip gain is 1.2 below its knee, so 0.25 records as 0.3.
+            let x = buf[7000];
+            assert!((x - sign * 0.3).abs() < 1e-3, "{quirks:?}: recorded {x}");
+            v.reset();
+            assert_eq!(v.fade_time(), fade, "{quirks:?} after reset");
+        }
     }
 
     #[test]

@@ -11,8 +11,9 @@
 //! [`apply`](Engine::apply) them on the audio thread before each block. The
 //! `rtrb` feature adds the `rt` module, which packages that pattern.
 //!
-//! Output tracks the C++ implementation, including two upstream quirks:
-//! recorded material is polarity-inverted, and the default fade time is 0.1 s.
+//! By default output tracks the C++ implementation, including two upstream
+//! quirks: recorded material is polarity-inverted, and the fade time after
+//! reset is 0.1 s. [`Quirks::Fixed`] corrects both.
 //!
 //! ```
 //! use softcut::Voice;
@@ -33,6 +34,7 @@
 //! assert!(buf.iter().any(|&x| x != 0.0));
 //! ```
 
+pub mod buffer;
 mod dsp;
 mod engine;
 mod head;
@@ -43,4 +45,4 @@ mod svf;
 mod voice;
 
 pub use engine::{Engine, EngineCmd, EngineConfig, VoiceMix};
-pub use voice::{Voice, VoiceCmd};
+pub use voice::{Quirks, Voice, VoiceCmd};

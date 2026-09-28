@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use softcut::{Engine, EngineCmd, EngineConfig, Voice, VoiceCmd};
+use softcut::{Engine, EngineCmd, EngineConfig, Voice, VoiceCmd, buffer};
 
 const SR: f32 = 48000.0;
 const FRAMES: usize = 1 << 15;
@@ -210,6 +210,7 @@ fn engine_feedback() {
         buffer_frames: FRAMES,
         block_size: 64,
         out_channels: 2,
+        ..Default::default()
     });
     let (mut pos, mut out, mut states) = (0, Vec::new(), Vec::new());
     for line in ops.lines() {
@@ -248,4 +249,23 @@ fn engine_feedback() {
         TOL,
     );
     assert_state(name, &states);
+}
+
+#[test]
+fn buffer_ops() {
+    let name = "buffer_ops";
+    let mut buf = read_f32(name, "in.f32");
+    let src = read_f32(name, "src.f32");
+    let ops = fs::read_to_string(fixture(name, "ops")).unwrap();
+    for line in ops.lines() {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let u = |k: usize| w[k].parse::<usize>().unwrap();
+        let x = |k: usize| w[k].parse::<f32>().unwrap();
+        match w[0] {
+            "write" => buffer::write(&mut buf, u(1), &src[u(2)..u(2) + u(3)], x(4), x(5), u(6)),
+            "clear" => buffer::clear(&mut buf, u(1), u(2), x(3), u(4)),
+            op => panic!("unknown op {op}"),
+        }
+    }
+    assert_close("buffer ops", &buf, &read_f32(name, "buf.f32"), TOL);
 }

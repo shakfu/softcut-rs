@@ -12,12 +12,6 @@
 
 ## Medium
 
-- [ ] `fix-upstream-quirks` feature: correct the polarity inversion (the "raised" rec fade curve computes `-sin(x)`) and the 0.1 s default fade time (upstream sets 0.01 s, then the head's init overrides it). Norns parity stays the default, so the golden tests keep passing.
-
-- [ ] Stereo. Each voice is mono, as upstream. norns makes stereo from two voices over two buffers. The library supports several buffers; the demo uses one.
-
-- [ ] norns buffer operations: read/copy/clear with edge fades (softcut-py's `buffer_ops.hpp`), and writing a buffer to a file, for saving loops.
-
 - [ ] Better resampling for WAV loads than linear interpolation, for quality at mismatched sample rates.
 
 ## Low
@@ -35,3 +29,9 @@
 - [x] `Voice` getters for every setting, read from DSP state.
 
 - [x] Demo: mic input can be switched off; the mic stream is paused unless selected.
+
+- [x] Upstream quirks switchable: `Quirks::Fixed` (a constructor argument; a Cargo feature would unify across the dependency graph).
+
+- [x] Stereo: multichannel engine input with a channel-to-voice level matrix; demo runs two linked stereo pairs over L/R buffers.
+
+- [x] norns buffer operations (`softcut::buffer`, `ClearRegion`/`CopyRegion`, `rt::Handle::write`/`snapshot`), and WAV save in the demo.

@@ -279,13 +279,49 @@ def run_engine(name, inp, ops):
     save(name, ops, inp, out, buf, states)
 
 
+# Buffer ops: blended writes and clears through softcut-py's `_buffer_apply`
+# (buffer_ops.hpp). Ops, applied in order to one buffer:
+#   write <start> <src_offset> <len> <preserve> <mix> <fade>
+#   clear <start> <count> <preserve> <fade>
+BUFFER_OPS = """
+write 100 0 1000 0 1 0
+write 500 1000 800 0.5 0.8 64
+clear 700 300 0 32
+clear 1200 400 0.25 0
+write 3900 0 500 0.3 1 50
+clear 4000 500 0.5 20
+"""
+
+
+def run_buffer_ops():
+    from softcut import _core
+
+    ops = "\n".join(line.strip() for line in BUFFER_OPS.strip().splitlines()) + "\n"
+    buf = f32(noise(4096, 0.5, 4))
+    src = f32(noise(2048, 0.7, 5))
+    initial = list(buf)
+    for line in ops.splitlines():
+        w = line.split()
+        if w[0] == "write":
+            start, off, n = int(w[1]), int(w[2]), int(w[3])
+            _core._buffer_apply(buf, start, src[off : off + n], float(w[4]), float(w[5]), int(w[6]))
+        else:
+            start, count = int(w[1]), int(w[2])
+            _core._buffer_apply(buf, start, None, float(w[3]), 0.0, int(w[4]), count)
+    (OUT / "buffer_ops.ops").write_text(ops)
+    for suffix, data in (("in", initial), ("src", src), ("buf", buf)):
+        with open(OUT / f"buffer_ops.{suffix}.f32", "wb") as fh:
+            f32(data).tofile(fh)
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     for name, (inp, ops) in VOICE_SCENARIOS.items():
         run_voice(name, inp, ops)
     for name, (inp, ops) in ENGINE_SCENARIOS.items():
         run_engine(name, inp, ops)
-    print(f"wrote {len(VOICE_SCENARIOS) + len(ENGINE_SCENARIOS)} scenarios to {OUT}")
+    run_buffer_ops()
+    print(f"wrote {len(VOICE_SCENARIOS) + len(ENGINE_SCENARIOS) + 1} scenarios to {OUT}")
 
 
 if __name__ == "__main__":

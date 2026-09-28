@@ -1,19 +1,20 @@
-//! WAV loading into a softcut buffer: decode, mix to mono, resample.
+//! WAV loading into a stereo pair of softcut buffers, and saving from one.
 
 use std::path::Path;
 
 pub struct Loaded {
-    /// Exactly the buffer's length; zero-padded past the file's end.
-    pub data: Box<[f32]>,
-    /// Duration of the file content in the buffer.
+    /// Left and right, each exactly the buffer's length and zero-padded past
+    /// the file's end. A mono file fills both.
+    pub data: [Box<[f32]>; 2],
+    /// Duration of the file content in the buffers.
     pub seconds: f32,
     pub truncated: bool,
     pub source_rate: u32,
 }
 
-/// Decode any PCM or float WAV into a mono buffer of `frames` samples at
-/// `rate`. Channels are averaged. Resampling is linear, which is adequate for
-/// a demo and adds no dependency.
+/// Decode any PCM or float WAV into two buffers of `frames` samples at `rate`.
+/// Channels past the second are ignored. Resampling is linear, which is
+/// adequate for a demo and adds no dependency.
 pub fn load(path: &Path, rate: f32, frames: usize) -> Result<Loaded, String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
     let spec = reader.spec();
@@ -29,23 +30,24 @@ pub fn load(path: &Path, rate: f32, frames: usize) -> Result<Loaded, String> {
         }
     }
     .map_err(|e| e.to_string())?;
-    let mono: Vec<f32> = interleaved
-        .chunks_exact(channels)
-        .map(|f| f.iter().sum::<f32>() / channels as f32)
-        .collect();
+    let total = interleaved.len() / channels;
 
     let step = spec.sample_rate as f64 / rate as f64;
-    let wanted = (mono.len() as f64 / step).floor() as usize;
+    let wanted = (total as f64 / step).floor() as usize;
     let n = wanted.min(frames);
-    let mut data = vec![0.0f32; frames].into_boxed_slice();
-    for (i, y) in data[..n].iter_mut().enumerate() {
-        let pos = i as f64 * step;
-        let k = pos as usize;
-        let frac = (pos - k as f64) as f32;
-        let a = mono[k];
-        let b = mono.get(k + 1).copied().unwrap_or(a);
-        *y = a + (b - a) * frac;
-    }
+    let data = [0, 1].map(|side| {
+        let col = side.min(channels - 1);
+        let x = |k: usize| interleaved[k * channels + col];
+        let mut out = vec![0.0f32; frames].into_boxed_slice();
+        for (i, y) in out[..n].iter_mut().enumerate() {
+            let pos = i as f64 * step;
+            let k = pos as usize;
+            let frac = (pos - k as f64) as f32;
+            let (a, b) = (x(k), if k + 1 < total { x(k + 1) } else { x(k) });
+            *y = a + (b - a) * frac;
+        }
+        out
+    });
     Ok(Loaded {
         data,
         seconds: n as f32 / rate,
@@ -54,13 +56,33 @@ pub fn load(path: &Path, rate: f32, frames: usize) -> Result<Loaded, String> {
     })
 }
 
+/// Write `left` and `right` as a stereo 32-bit float WAV, lossless for
+/// softcut's f32 buffers. The shorter channel sets the length.
+pub fn save(path: &Path, left: &[f32], right: &[f32], rate: u32) -> Result<(), String> {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(path, spec).map_err(|e| e.to_string())?;
+    for (&l, &r) in left.iter().zip(right) {
+        w.write_sample(l).map_err(|e| e.to_string())?;
+        w.write_sample(r).map_err(|e| e.to_string())?;
+    }
+    w.finalize().map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn temp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("softcut-demo-{}-{name}.wav", std::process::id()))
+    }
+
     fn write(name: &str, spec: hound::WavSpec, samples: &[f32]) -> std::path::PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("softcut-demo-{}-{name}.wav", std::process::id()));
+        let path = temp(name);
         let mut w = hound::WavWriter::create(&path, spec).unwrap();
         for &s in samples {
             match spec.sample_format {
@@ -73,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn stereo_int16_is_mixed_and_upsampled() {
+    fn stereo_int16_keeps_channels_and_upsamples() {
         let spec = hound::WavSpec {
             channels: 2,
             sample_rate: 24000,
@@ -85,15 +107,16 @@ mod tests {
         let path = write("int16", spec, &samples);
         let l = load(&path, 48000.0, 1 << 14).unwrap();
         std::fs::remove_file(path).ok();
-        assert_eq!(l.data.len(), 1 << 14);
+        assert_eq!(l.data[0].len(), 1 << 14);
         assert!((l.seconds - 0.1).abs() < 1e-3, "{}", l.seconds);
         assert!(!l.truncated);
-        assert!((l.data[100] - 0.125).abs() < 1e-3, "{}", l.data[100]);
-        assert_eq!(l.data[4800], 0.0);
+        assert!((l.data[0][100] - 0.5).abs() < 1e-3, "{}", l.data[0][100]);
+        assert!((l.data[1][100] + 0.25).abs() < 1e-3, "{}", l.data[1][100]);
+        assert_eq!((l.data[0][4800], l.data[1][4800]), (0.0, 0.0));
     }
 
     #[test]
-    fn float_mono_longer_than_buffer_is_truncated() {
+    fn float_mono_fills_both_sides_and_truncates() {
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: 48000,
@@ -105,8 +128,21 @@ mod tests {
         let l = load(&path, 48000.0, 1024).unwrap();
         std::fs::remove_file(path).ok();
         assert!(l.truncated);
-        assert_eq!(l.data.len(), 1024);
-        assert_eq!(l.data[1023], 1023.0 / 3000.0);
+        assert_eq!(l.data[0], l.data[1]);
+        assert_eq!(l.data[0][1023], 1023.0 / 3000.0);
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let left: Vec<f32> = (0..500).map(|i| (i as f32 * 0.01).sin()).collect();
+        let right: Vec<f32> = left.iter().map(|x| -x * 0.5).collect();
+        let path = temp("roundtrip");
+        save(&path, &left, &right, 44100).unwrap();
+        let l = load(&path, 44100.0, 1024).unwrap();
+        std::fs::remove_file(path).ok();
+        assert_eq!(l.source_rate, 44100);
+        assert_eq!(&l.data[0][..500], &left[..]);
+        assert_eq!(&l.data[1][..500], &right[..]);
     }
 
     #[test]
