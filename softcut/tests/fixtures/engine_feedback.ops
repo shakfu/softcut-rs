@@ -1,0 +1,25 @@
+vset 0 loop_start 0
+vset 0 loop_end 0.2
+vset 0 loop 1
+vset 0 rec_level 1
+vset 0 rec 1
+vset 0 play 1
+vcut 0 0
+vset 1 loop_start 0.2
+vset 1 loop_end 0.35
+vset 1 loop 1
+vset 1 rec_level 0.7
+vset 1 pre_level 0.5
+vset 1 rate -1.25
+vset 1 rec 1
+vset 1 play 1
+vcut 1 0.3
+pan 0 -0.6
+pan 1 0.8
+level 1 0.7
+input_gain 1 0.3
+fb 0 1 0.5
+fb 1 1 0.2
+process 10000
+fb 1 0 0.4
+process 10000

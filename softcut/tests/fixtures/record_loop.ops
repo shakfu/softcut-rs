@@ -1,0 +1,11 @@
+set loop_start 0
+set loop_end 0.5
+set loop 1
+set rec_level 1
+set pre_level 0
+set rec 1
+set play 1
+cut 0
+process 30000
+set rec 0
+process 10000

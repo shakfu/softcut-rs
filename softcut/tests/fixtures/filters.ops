@@ -1,0 +1,22 @@
+set loop_start 0
+set loop_end 0.25
+set loop 1
+set rec_level 1
+set pre_filter_lp 0
+set pre_filter_bp 1
+set pre_filter_fc 2000
+set pre_filter_rq 1
+set pre_filter_dry 0.2
+set post_filter_hp 1
+set post_filter_lp 0.5
+set post_filter_fc 500
+set post_filter_rq 2
+set post_filter_dry 0
+set rec 1
+set play 1
+cut 0
+set rate 0.5
+set pre_filter_fc_mod 1
+process 15000
+set pre_filter_fc 5000
+process 15000

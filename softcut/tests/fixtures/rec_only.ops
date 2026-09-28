@@ -1,0 +1,7 @@
+set loop_start 0
+set loop_end 0.3
+set loop 1
+set rec_level 1
+set pre_level 0.25
+set rec 1
+process 20000

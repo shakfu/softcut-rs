@@ -1,0 +1,13 @@
+[package]
+name = "softcut"
+version = "0.1.0"
+description = "Rust port of monome softcut: crossfaded, resampling record/play heads over audio buffers"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rtrb = { version = "0.4", optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
