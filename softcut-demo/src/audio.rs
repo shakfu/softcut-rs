@@ -6,8 +6,9 @@
 //! input.
 //!
 //! The engine's sample rate is the startup output device's, and stays fixed:
-//! buffers, loop points and positions are all counted at it. Inputs at other
-//! rates are resampled to it; outputs must support it.
+//! buffers, loop points and positions are all counted at it. Devices at other
+//! rates are resampled: inputs in their callback, steered against clock drift
+//! by a [`DriftServo`]; outputs in the render loop.
 
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use softcut::rt::{self, Handle, Processor};
 use softcut::{Engine, EngineConfig, Quirks};
 
-use crate::resample::Streamer;
+use crate::resample::{DriftServo, Streamer};
 
 pub const VOICES: usize = 4;
 pub const BUFFERS: usize = 2;
@@ -27,8 +28,14 @@ const BLOCK: usize = 64;
 const MAX_FRAMES: usize = 4096;
 /// Buffer samples rescanned for the waveform per callback, over both buffers.
 const SCAN_BUDGET: usize = 32768;
+/// Input frames kept queued: the input's latency, and the headroom that
+/// absorbs callback jitter. Reading waits until this much has arrived, after
+/// startup and after any underrun.
+const INPUT_FILL: usize = 1024;
 /// Input frames queued beyond this are dropped, to bound input latency.
-const MAX_INPUT_BACKLOG: usize = 2048;
+const MAX_INPUT_BACKLOG: usize = 2 * INPUT_FILL;
+/// Resampled output frames buffered between engine blocks.
+const PENDING_FRAMES: usize = 4096;
 /// Platforms where cpal opens an output device as a system-audio input.
 pub const LOOPBACK: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
@@ -178,10 +185,11 @@ struct Input {
     rate: u32,
 }
 
-/// The open output stream and its device's name.
+/// The open output stream, its device's name and the rate it runs at.
 struct Output {
     stream: cpal::Stream,
     name: String,
+    rate: u32,
 }
 
 pub struct Audio {
@@ -289,25 +297,37 @@ impl Audio {
         &self.output.name
     }
 
-    /// Play through `outputs[device]`. The device must run at the engine's
-    /// rate. On failure the previous output keeps playing.
+    /// The open output's rate, which differs from `sample_rate` when resampled.
+    pub fn output_rate(&self) -> u32 {
+        self.output.rate
+    }
+
+    /// Play through `outputs[device]`, resampled if it cannot run at the
+    /// engine's rate. On failure the previous output keeps playing.
     pub fn select_output(&mut self, device: usize) -> Result<(), String> {
         let dev = self.outputs.get(device).ok_or("no such device")?;
         let _ = self.output.stream.pause();
-        match open_output(&dev.device, self.sample_rate as u32, self.state.clone()) {
-            Ok(stream) => {
-                // Dropping the old stream stops its callbacks.
-                self.output = Output {
-                    stream,
-                    name: dev.name.clone(),
-                };
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.output.stream.play();
-                Err(e)
-            }
-        }
+        let (stream, rate) =
+            match open_output(&dev.device, self.sample_rate as u32, self.state.clone()) {
+                Ok(opened) => opened,
+                Err(e) => {
+                    let _ = self.output.stream.play();
+                    return Err(e);
+                }
+            };
+        // Neither stream is running, so this lock is uncontended.
+        self.state
+            .lock()
+            .map_err(|_| "audio state poisoned")?
+            .set_output_rate(self.sample_rate as u32, rate);
+        stream.play().map_err(|e| e.to_string())?;
+        // Dropping the old stream stops its callbacks.
+        self.output = Output {
+            stream,
+            name: dev.name.clone(),
+            rate,
+        };
+        Ok(())
     }
 
     /// Re-enumerate devices, keeping the open input selected if still present.
@@ -369,16 +389,17 @@ pub fn start(setup: impl FnOnce(&mut Engine)) -> Result<Audio, String> {
         input_signal: AtomicU64::new(0),
         view_frames: AtomicUsize::new(BUFFER_FRAMES),
     });
-    let state = Arc::new(Mutex::new(AudioState {
+    let state = Arc::new(Mutex::new(AudioState::new(
         processor,
-        input: input_rx,
-        meters: meters.clone(),
-        stereo_in: vec![0.0; MAX_FRAMES * 2],
-        stereo_out: vec![0.0; MAX_FRAMES * 2],
-        scan_bin: 0,
-        scan_view: 0,
-    }));
-    let stream = open_output(out_dev, sample_rate, state.clone())?;
+        input_rx,
+        meters.clone(),
+    )));
+    let (stream, out_rate) = open_output(out_dev, sample_rate, state.clone())?;
+    state
+        .lock()
+        .map_err(|_| "audio state poisoned")?
+        .set_output_rate(sample_rate, out_rate);
+    stream.play().map_err(|e| e.to_string())?;
 
     let mut audio = Audio {
         handle,
@@ -395,6 +416,7 @@ pub fn start(setup: impl FnOnce(&mut Engine)) -> Result<Audio, String> {
         output: Output {
             stream,
             name: output_name,
+            rate: out_rate,
         },
     };
     audio.input_error = match audio.inputs.first() {
@@ -404,20 +426,30 @@ pub fn start(setup: impl FnOnce(&mut Engine)) -> Result<Audio, String> {
     Ok(audio)
 }
 
-/// Opens and starts `dev` at `rate`, rendering from `state`, preferring a
-/// stereo layout.
+/// Opens `dev`, not yet playing, rendering from `state`: at `rate` if the
+/// device offers it, else at its nearest rate. Prefers a stereo layout.
+/// Returns the stream and the rate it runs at.
 fn open_output(
     dev: &cpal::Device,
     rate: cpal::SampleRate,
     state: Arc<Mutex<AudioState>>,
-) -> Result<cpal::Stream, String> {
+) -> Result<(cpal::Stream, cpal::SampleRate), String> {
     let cfg = dev
         .supported_output_configs()
         .map_err(|e| e.to_string())?
         .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
-        .filter_map(|c| c.try_with_sample_rate(rate))
-        .max_by_key(|c| (c.channels() == 2, c.channels()))
-        .ok_or_else(|| format!("device has no f32 output at the engine's {rate} Hz"))?;
+        .map(|c| {
+            let r = rate.clamp(c.min_sample_rate(), c.max_sample_rate());
+            (
+                r == rate,
+                c.channels() == 2,
+                c.channels(),
+                c.with_sample_rate(r),
+            )
+        })
+        .max_by_key(|&(exact, stereo, channels, _)| (exact, stereo, channels))
+        .map(|(.., c)| c)
+        .ok_or("device has no f32 output")?;
     let channels = cfg.channels() as usize;
     let stream = dev
         .build_output_stream::<f32, _, _>(
@@ -431,8 +463,8 @@ fn open_output(
             None,
         )
         .map_err(|e| e.to_string())?;
-    stream.play().map_err(|e| e.to_string())?;
-    Ok(stream)
+    stream.pause().map_err(|e| e.to_string())?;
+    Ok((stream, cfg.sample_rate()))
 }
 
 /// Opens `dev`, paused, forwarding channels `first` and `first + 1` (or
@@ -472,6 +504,7 @@ fn open_input(
     }
     let dev_rate = cfg.sample_rate();
     let mut resampler = (dev_rate != rate).then(|| Streamer::new(dev_rate as f64, rate as f64));
+    let mut servo = DriftServo::new(INPUT_FILL as f64);
     let (l, r) = (first, (first + 1).min(channels - 1));
     let stream = dev
         .device
@@ -486,6 +519,11 @@ fn open_input(
                 }
                 // Never blocks: contended only while a switch has two streams open.
                 let Ok(mut tx) = tx.try_lock() else { return };
+                if let Some(s) = &mut resampler {
+                    let fill = (tx.buffer().capacity() - tx.slots()) / 2;
+                    let dt = (data.len() / channels) as f64 / dev_rate as f64;
+                    s.set_adjust(servo.update(fill as f64, dt));
+                }
                 for frame in data.chunks_exact(channels) {
                     // Both samples or neither, so the ring never splits a frame;
                     // a full ring drops the frame.
@@ -508,38 +546,110 @@ fn open_input(
     Ok((stream, channels, dev_rate))
 }
 
+/// Write a stereo frame to a device frame: mixed on mono, into the first two
+/// channels otherwise.
+fn write_frame(dst: &mut [f32], lr: [f32; 2]) {
+    match dst.len() {
+        1 => dst[0] = 0.5 * (lr[0] + lr[1]),
+        _ => {
+            dst[..2].copy_from_slice(&lr);
+            dst[2..].fill(0.0);
+        }
+    }
+}
+
 struct AudioState {
     processor: Processor,
     input: Consumer<f32>,
+    /// False until `INPUT_FILL` frames have queued, at startup and after an underrun.
+    primed: bool,
     meters: Arc<Meters>,
     stereo_in: Vec<f32>,
     stereo_out: Vec<f32>,
+    /// Engine rate to device rate, when they differ.
+    out_resampler: Option<Streamer>,
+    /// Resampled frames not yet written to the device, from `pending_pos` on.
+    pending: Vec<[f32; 2]>,
+    pending_pos: usize,
     scan_bin: usize,
     /// The view length the current scan pass is for.
     scan_view: usize,
 }
 
 impl AudioState {
+    fn new(processor: Processor, input: Consumer<f32>, meters: Arc<Meters>) -> Self {
+        Self {
+            processor,
+            input,
+            primed: false,
+            meters,
+            stereo_in: vec![0.0; MAX_FRAMES * 2],
+            stereo_out: vec![0.0; MAX_FRAMES * 2],
+            out_resampler: None,
+            pending: Vec::with_capacity(PENDING_FRAMES),
+            pending_pos: 0,
+            scan_bin: 0,
+            scan_view: 0,
+        }
+    }
+
+    /// Resample to `device` Hz from the engine's `engine` Hz, or stop resampling.
+    fn set_output_rate(&mut self, engine: u32, device: u32) {
+        self.out_resampler =
+            (engine != device).then(|| Streamer::new(engine as f64, device as f64));
+        self.pending.clear();
+        self.pending_pos = 0;
+    }
+
     fn render(&mut self, data: &mut [f32], channels: usize) {
-        for chunk in data.chunks_mut(MAX_FRAMES * channels) {
-            let frames = chunk.len() / channels;
-            self.fill_input(frames);
-            let (inp, out) = (
-                &self.stereo_in[..frames * 2],
-                &mut self.stereo_out[..frames * 2],
-            );
-            self.processor.process(inp, out);
-            for (dst, src) in chunk.chunks_exact_mut(channels).zip(out.as_chunks::<2>().0) {
-                match channels {
-                    1 => dst[0] = 0.5 * (src[0] + src[1]),
-                    _ => {
-                        dst[..2].copy_from_slice(src);
-                        dst[2..].fill(0.0);
-                    }
+        if self.out_resampler.is_some() {
+            self.render_resampled(data, channels);
+        } else {
+            for chunk in data.chunks_mut(MAX_FRAMES * channels) {
+                let frames = chunk.len() / channels;
+                self.fill_input(frames);
+                let (inp, out) = (
+                    &self.stereo_in[..frames * 2],
+                    &mut self.stereo_out[..frames * 2],
+                );
+                self.processor.process(inp, out);
+                for (dst, src) in chunk.chunks_exact_mut(channels).zip(out.as_chunks::<2>().0) {
+                    write_frame(dst, *src);
                 }
             }
         }
         self.scan_waveform();
+    }
+
+    /// Render engine blocks at the engine's rate as the device asks for
+    /// frames, resampling each into `pending`.
+    fn render_resampled(&mut self, data: &mut [f32], channels: usize) {
+        for dst in data.chunks_exact_mut(channels) {
+            // A block can emit nothing while the kernel's history fills.
+            while self.pending_pos == self.pending.len() {
+                self.pending.clear();
+                self.pending_pos = 0;
+                self.fill_input(BLOCK);
+                let (inp, out) = (
+                    &self.stereo_in[..BLOCK * 2],
+                    &mut self.stereo_out[..BLOCK * 2],
+                );
+                self.processor.process(inp, out);
+                let (Some(rs), pending) = (self.out_resampler.as_mut(), &mut self.pending) else {
+                    unreachable!("render_resampled without a resampler")
+                };
+                for frame in self.stereo_out[..BLOCK * 2].as_chunks::<2>().0 {
+                    rs.push(*frame, |o| {
+                        // Never reallocate on the audio thread.
+                        if pending.len() < pending.capacity() {
+                            pending.push(o);
+                        }
+                    });
+                }
+            }
+            write_frame(dst, self.pending[self.pending_pos]);
+            self.pending_pos += 1;
+        }
     }
 
     fn fill_input(&mut self, frames: usize) {
@@ -553,7 +663,18 @@ impl AudioState {
         {
             c.commit_all();
         }
-        let got = rx.pop_partial_slice(buf).0.len();
+        if !self.primed && rx.slots() >= 2 * INPUT_FILL {
+            self.primed = true;
+        }
+        let got = if self.primed {
+            rx.pop_partial_slice(buf).0.len()
+        } else {
+            0
+        };
+        if got < buf.len() {
+            // Underrun: wait for the queue to refill before reading again.
+            self.primed = false;
+        }
         match Source::from_u8(self.meters.source.load(Relaxed)) {
             Source::On => buf[got..].fill(0.0),
             Source::Off => buf.fill(0.0),
@@ -587,5 +708,95 @@ impl AudioState {
             }
             self.scan_bin = (b + 1) % WAVE_BINS;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use softcut::{EngineCmd, VoiceCmd};
+
+    fn state(engine: Engine) -> (AudioState, Producer<f32>) {
+        let (tx, rx) = RingBuffer::new(MAX_FRAMES * 4);
+        let meters = Arc::new(Meters {
+            source: AtomicU8::new(Source::On as u8),
+            peaks: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
+            input_peak: AtomicU32::new(0),
+            input_frames: AtomicU64::new(0),
+            input_signal: AtomicU64::new(0),
+            view_frames: AtomicUsize::new(BUFFER_FRAMES),
+        });
+        let (_handle, processor) = rt::split(engine, 16);
+        (AudioState::new(processor, rx, meters), tx)
+    }
+
+    /// A 1 kHz loop rendered from a 44.1 kHz engine to a 48 kHz device stays
+    /// 1 kHz, with no jump larger than the sine's own step.
+    #[test]
+    fn output_resampling_keeps_pitch_and_continuity() {
+        let mut e = engine(44100.0);
+        for (i, x) in e.buffer_mut(0).iter_mut().enumerate() {
+            *x = 0.5 * (std::f32::consts::TAU * 1000.0 * i as f32 / 44100.0).sin();
+        }
+        // One second is exactly 1000 cycles, so the loop has no seam.
+        for c in [
+            VoiceCmd::LoopEnd(1.0),
+            VoiceCmd::Loop(true),
+            VoiceCmd::Play(true),
+        ] {
+            e.apply(EngineCmd::Voice(0, c));
+        }
+        e.apply(EngineCmd::Pan(0, -1.0));
+        let (mut st, _tx) = state(e);
+        st.set_output_rate(44100, 48000);
+
+        let mut left = Vec::new();
+        let mut data = vec![0.0; 512 * 2];
+        for _ in 0..(48000 / 512) {
+            st.render(&mut data, 2);
+            left.extend(data.as_chunks::<2>().0.iter().map(|f| f[0]));
+        }
+        let settled = &left[1000..];
+        let crossings = settled
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count();
+        let seconds = settled.len() as f32 / 48000.0;
+        let hz = crossings as f32 / 2.0 / seconds;
+        assert!((hz - 1000.0).abs() < 5.0, "{hz} Hz");
+        let step = 0.5 * std::f32::consts::TAU * 1000.0 / 48000.0;
+        let jump = settled
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(jump < 1.05 * step, "jump {jump} vs step {step}");
+    }
+
+    #[test]
+    fn input_waits_until_primed_and_after_underrun() {
+        let (mut st, mut tx) = state(engine(44100.0));
+        let push = |tx: &mut Producer<f32>, frames: usize| {
+            for _ in 0..frames {
+                tx.push_entire_slice(&[0.5, 0.5]).unwrap();
+            }
+        };
+        push(&mut tx, INPUT_FILL - 1);
+        st.fill_input(256);
+        assert!(
+            st.stereo_in[..512].iter().all(|&x| x == 0.0),
+            "read before primed"
+        );
+        push(&mut tx, 1);
+        st.fill_input(256);
+        assert!(st.stereo_in[..512].iter().all(|&x| x == 0.5), "primed read");
+        // 768 frames left; ask for more to underrun.
+        st.fill_input(1000);
+        assert!(!st.primed);
+        push(&mut tx, 100);
+        st.fill_input(64);
+        assert!(
+            st.stereo_in[..128].iter().all(|&x| x == 0.0),
+            "read while refilling"
+        );
     }
 }

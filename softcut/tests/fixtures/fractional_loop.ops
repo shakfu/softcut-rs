@@ -1,0 +1,14 @@
+set loop_start 0.0123457
+set loop_end 0.3456789
+set loop 1
+set fade_time 0.02
+set rec_level 1
+set pre_level 0.5
+set rec 1
+set play 1
+cut 0.0123457
+process 20000
+set rate 0.75
+process 10000
+set rec 0
+process 10000

@@ -11,6 +11,8 @@ and writes, per scenario, into softcut/tests/fixtures/:
                   (Python's rec/play readbacks mirror the last set value, not DSP
                   state, so they are omitted)
 
+Pass scenario names to regenerate only those; with none, all are written.
+
 Needs softcut-py (github.com/shakfu/softcut-py) built from current source.
 An installed build older than its source may not match these calls:
   uv venv /tmp/sc && uv pip install --python /tmp/sc/bin/python ../softcut-py
@@ -148,6 +150,26 @@ VOICE_SCENARIOS = {
         cut 0.05
         """
         + "process 1000\n" * 30,
+    ),
+    # Loop points between samples: 592.59 and 16592.59 frames at 48 kHz.
+    "fractional_loop": (
+        sine(40000, 220, 0.4),
+        """
+        set loop_start 0.0123457
+        set loop_end 0.3456789
+        set loop 1
+        set fade_time 0.02
+        set rec_level 1
+        set pre_level 0.5
+        set rec 1
+        set play 1
+        cut 0.0123457
+        process 20000
+        set rate 0.75
+        process 10000
+        set rec 0
+        process 10000
+        """,
     ),
     "rec_only": (
         sine(20000, 440, 0.6),
@@ -315,13 +337,22 @@ def run_buffer_ops():
 
 
 def main():
+    import sys
+
+    known = [*VOICE_SCENARIOS, *ENGINE_SCENARIOS, "buffer_ops"]
+    names = sys.argv[1:] or known
+    unknown = set(names) - set(known)
+    if unknown:
+        sys.exit(f"unknown scenarios: {sorted(unknown)}; known: {known}")
     OUT.mkdir(parents=True, exist_ok=True)
-    for name, (inp, ops) in VOICE_SCENARIOS.items():
-        run_voice(name, inp, ops)
-    for name, (inp, ops) in ENGINE_SCENARIOS.items():
-        run_engine(name, inp, ops)
-    run_buffer_ops()
-    print(f"wrote {len(VOICE_SCENARIOS) + len(ENGINE_SCENARIOS) + 1} scenarios to {OUT}")
+    for name in names:
+        if name in VOICE_SCENARIOS:
+            run_voice(name, *VOICE_SCENARIOS[name])
+        elif name in ENGINE_SCENARIOS:
+            run_engine(name, *ENGINE_SCENARIOS[name])
+        else:
+            run_buffer_ops()
+    print(f"wrote {len(names)} scenarios to {OUT}")
 
 
 if __name__ == "__main__":

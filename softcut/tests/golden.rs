@@ -191,6 +191,13 @@ fn phase_quant() {
     run_voice("phase_quant", true, TOL);
 }
 
+/// Loop points between samples (592.59 and 16592.59 frames), with overdub
+/// and a rate change.
+#[test]
+fn fractional_loop() {
+    run_voice("fractional_loop", true, TOL);
+}
+
 /// Upstream leaves the output unwritten when recording without playing, so
 /// only the buffer is compared.
 #[test]

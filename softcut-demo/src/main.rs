@@ -693,8 +693,14 @@ impl App {
             if let Some(i) = pick {
                 let name = self.audio.outputs[i].name.clone();
                 self.status = match self.audio.select_output(i) {
-                    Ok(()) => format!("output: {name}"),
                     Err(e) => format!("{name}: {e}"),
+                    Ok(()) if self.audio.output_rate() as f32 != self.audio.sample_rate => {
+                        format!(
+                            "output: {name}, resampled to {} Hz",
+                            self.audio.output_rate()
+                        )
+                    }
+                    Ok(()) => format!("output: {name}"),
                 };
             }
         });
