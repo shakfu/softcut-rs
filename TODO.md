@@ -8,15 +8,17 @@
 
 - [x] Verify the demo by hand: mic input and the level meter, the file dialog, WAV drag-and-drop, and the waveform zoom. None of it has been seen or heard running.
 
-- [ ] Publish voice settings through `rt`. `Voice` getters exist, but a control thread using `rt::Handle` cannot call them; it must keep its own copy, as the demo does.
-
 ## Medium
-
-- [ ] Better resampling for WAV loads than linear interpolation, for quality at mismatched sample rates.
 
 ## Low
 
-- [ ] Fade-curve shape setters. They exist in C++ `FadeCurves`, but `softcut::Voice` never calls them.
+- [ ] Demo: resample input from devices that lack the output's sample rate (e.g. a 48 kHz-only device beside 44.1 kHz speakers), instead of refusing them.
+
+- [ ] Demo: system-audio capture. cpal 0.18 opens an output device as a loopback input on macOS 14.6+, but a probe here built the stream and received no callbacks, likely because an unbundled binary cannot request the System Audio Recording permission.
+
+- [ ] Demo: output device selection. The output stream's callback owns the engine, so switching needs a handover.
+
+- [ ] Publish voice settings through `rt`, only if a host with several control sources needs them. Until then a shadow `Voice` on the control thread covers it (documented in `rt`).
 
 - [ ] OSC control, and a layer mirroring the norns Lua API. Only needed to run existing norns scripts.
 
@@ -35,3 +37,9 @@
 - [x] Stereo: multichannel engine input with a channel-to-voice level matrix; demo runs two linked stereo pairs over L/R buffers.
 
 - [x] norns buffer operations (`softcut::buffer`, `ClearRegion`/`CopyRegion`, `rt::Handle::write`/`snapshot`), and WAV save in the demo.
+
+- [x] Windowed-sinc resampling for WAV loads in the demo.
+
+- [x] Fade-curve shapes and ratios on `Voice`, with the upstream raised-pre bug under `Quirks::Upstream`.
+
+- [x] Demo: input device and channel-pair selection.

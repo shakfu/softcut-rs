@@ -14,10 +14,10 @@ mod wav;
 
 use std::path::{Path, PathBuf};
 
-use audio::{Audio, BUFFER_FRAMES, BUFFERS, Source, VOICES, WAVE_BINS};
+use audio::{Audio, BUFFER_FRAMES, BUFFERS, InputDevice, Source, VOICES, WAVE_BINS};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use softcut::rt::Returned;
-use softcut::{Engine, EngineCmd, VoiceCmd};
+use softcut::{Engine, EngineCmd, FadeShape, VoiceCmd};
 
 const COLORS: [Color32; VOICES] = [
     Color32::from_rgb(230, 90, 80),
@@ -52,6 +52,10 @@ struct VoiceUi {
     post_hp: f32,
     post_bp: f32,
     post_dry: f32,
+    rec_fade_shape: FadeShape,
+    pre_fade_shape: FadeShape,
+    rec_delay_ratio: f32,
+    pre_window_ratio: f32,
     /// 0 = left buffer, 1 = right. The voice records the matching input channel.
     buffer: usize,
 }
@@ -81,6 +85,10 @@ impl VoiceUi {
             post_hp: 0.0,
             post_bp: 0.0,
             post_dry: 1.0,
+            rec_fade_shape: FadeShape::Raised,
+            pre_fade_shape: FadeShape::Linear,
+            rec_delay_ratio: 1.0 / 128.0,
+            pre_window_ratio: 1.0 / 8.0,
             buffer: 0,
         };
         match i {
@@ -144,6 +152,10 @@ impl VoiceUi {
         push!(post_hp, v(PostFilterHp(self.post_hp)));
         push!(post_bp, v(PostFilterBp(self.post_bp)));
         push!(post_dry, v(PostFilterDry(self.post_dry)));
+        push!(rec_fade_shape, v(RecFadeShape(self.rec_fade_shape)));
+        push!(pre_fade_shape, v(PreFadeShape(self.pre_fade_shape)));
+        push!(rec_delay_ratio, v(RecDelayRatio(self.rec_delay_ratio)));
+        push!(pre_window_ratio, v(PreWindowRatio(self.pre_window_ratio)));
         push!(level, EngineCmd::Level(i, self.level));
         push!(pan, EngineCmd::Pan(i, self.pan));
         push!(input_gain, EngineCmd::InputGain(i, self.input_gain));
@@ -520,6 +532,33 @@ impl App {
                 egui::Slider::new(&mut v.post_dry, 0.0..=1.0),
             );
         });
+        egui::CollapsingHeader::new("crossfade curves")
+            .id_salt("curves")
+            .show(ui, |ui| {
+                let shapes = [
+                    (FadeShape::Linear, "linear"),
+                    (FadeShape::Sine, "sine"),
+                    (FadeShape::Raised, "raised"),
+                ];
+                ui.horizontal(|ui| {
+                    ui.label("rec shape")
+                        .on_hover_text("how new input fades in across a crossfade");
+                    for (shape, name) in shapes {
+                        ui.selectable_value(&mut v.rec_fade_shape, shape, name);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("pre shape")
+                        .on_hover_text("how existing content is kept across a crossfade");
+                    for (shape, name) in shapes {
+                        ui.selectable_value(&mut v.pre_fade_shape, shape, name);
+                    }
+                });
+                ui.add(egui::Slider::new(&mut v.rec_delay_ratio, 0.0..=1.0).text("rec delay"))
+                    .on_hover_text("fraction of the crossfade before new input fades in");
+                ui.add(egui::Slider::new(&mut v.pre_window_ratio, 0.0..=1.0).text("pre window"))
+                    .on_hover_text("fraction of the crossfade over which existing content is kept");
+            });
 
         for t in self.targets(i) {
             let v = self.voices[t];
@@ -552,6 +591,79 @@ impl App {
                 });
             }
         }
+    }
+
+    /// Input device, channel pair, on/off and level.
+    fn input_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("input");
+            let current = self.audio.input_device();
+            let label = |d: &InputDevice| match d.is_default {
+                true => format!("{} (default)", d.name),
+                false => d.name.clone(),
+            };
+            let mut device_pick = None;
+            egui::ComboBox::from_id_salt("input device")
+                .width(240.0)
+                .selected_text(current.map_or("none".into(), |i| label(&self.audio.inputs[i])))
+                .show_ui(ui, |ui| {
+                    for (i, d) in self.audio.inputs.iter().enumerate() {
+                        if ui.selectable_label(current == Some(i), label(d)).clicked() {
+                            device_pick = Some(i);
+                        }
+                    }
+                });
+            let (first, channels) = self.audio.input_channels();
+            let mut channel_pick = None;
+            if channels > 2 {
+                let pair = |f: usize| match f + 1 < channels {
+                    true => format!("ch {}+{}", f + 1, f + 2),
+                    false => format!("ch {}", f + 1),
+                };
+                egui::ComboBox::from_id_salt("input channels")
+                    .selected_text(pair(first))
+                    .show_ui(ui, |ui| {
+                        for f in (0..channels).step_by(2) {
+                            if ui.selectable_label(f == first, pair(f)).clicked() {
+                                channel_pick = Some(f);
+                            }
+                        }
+                    });
+            }
+            if ui
+                .button("refresh")
+                .on_hover_text("list input devices again, e.g. after plugging one in")
+                .clicked()
+            {
+                self.audio.refresh_inputs();
+            }
+            let switch = match (device_pick, channel_pick) {
+                (Some(d), _) => Some((d, 0)),
+                (None, Some(f)) => current.map(|d| (d, f)),
+                _ => None,
+            };
+            if let Some((device, first)) = switch {
+                let name = self.audio.inputs[device].name.clone();
+                self.status = match self.audio.select_input(device, first) {
+                    Ok(()) => format!("input: {name}"),
+                    Err(e) => format!("{name}: {e}"),
+                };
+            }
+
+            let old = self.source;
+            ui.add_enabled_ui(self.audio.input_device().is_some(), |ui| {
+                ui.selectable_value(&mut self.source, Source::On, "on")
+                    .on_disabled_hover_text(self.audio.input_error.clone().unwrap_or_default());
+            });
+            ui.selectable_value(&mut self.source, Source::Off, "off");
+            if self.source != old
+                && let Err(e) = self.audio.set_source(self.source)
+            {
+                self.status = format!("input: {e}");
+                self.source = old;
+            }
+            self.input_meter(ui);
+        });
     }
 
     fn feedback_matrix(&mut self, ui: &mut egui::Ui) {
@@ -615,21 +727,8 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            self.input_row(ui);
             ui.horizontal(|ui| {
-                ui.label("input");
-                let old = self.source;
-                ui.add_enabled_ui(self.audio.input_error.is_none(), |ui| {
-                    ui.selectable_value(&mut self.source, Source::Mic, "mic")
-                        .on_disabled_hover_text(self.audio.input_error.clone().unwrap_or_default());
-                });
-                ui.selectable_value(&mut self.source, Source::Off, "off");
-                if self.source != old
-                    && let Err(e) = self.audio.set_source(self.source)
-                {
-                    self.status = format!("mic: {e}");
-                    self.source = old;
-                }
-                self.input_meter(ui);
                 if ui.button("clear buffers").clicked() {
                     for b in 0..BUFFERS {
                         self.send(EngineCmd::ClearBuffer(b));
@@ -718,8 +817,8 @@ fn main() -> eframe::Result {
         source: Source::Off,
         drag_from: None,
         status: match &input_error {
-            None => "Load a WAV, or choose mic and press rec on voice 1.".into(),
-            Some(e) => format!("Mic unavailable: {e}. Load a WAV to play."),
+            None => "Load a WAV, or turn the input on and press rec on voice 1.".into(),
+            Some(e) => format!("Input unavailable: {e}. Load a WAV to play."),
         },
         meter: 0.0,
         sample_seconds: None,

@@ -13,8 +13,8 @@ pub struct Loaded {
 }
 
 /// Decode any PCM or float WAV into two buffers of `frames` samples at `rate`.
-/// Channels past the second are ignored. Resampling is linear, which is
-/// adequate for a demo and adds no dependency.
+/// Channels past the second are ignored. A file at another rate is resampled
+/// with [`resample`].
 pub fn load(path: &Path, rate: f32, frames: usize) -> Result<Loaded, String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
     let spec = reader.spec();
@@ -35,18 +35,22 @@ pub fn load(path: &Path, rate: f32, frames: usize) -> Result<Loaded, String> {
     let step = spec.sample_rate as f64 / rate as f64;
     let wanted = (total as f64 / step).floor() as usize;
     let n = wanted.min(frames);
-    let data = [0, 1].map(|side| {
-        let col = side.min(channels - 1);
-        let x = |k: usize| interleaved[k * channels + col];
+    // The channels are independent, so resample them in parallel.
+    let side = |col: usize| {
+        let col = col.min(channels - 1);
+        let channel: Vec<f32> = interleaved
+            .iter()
+            .skip(col)
+            .step_by(channels)
+            .copied()
+            .collect();
         let mut out = vec![0.0f32; frames].into_boxed_slice();
-        for (i, y) in out[..n].iter_mut().enumerate() {
-            let pos = i as f64 * step;
-            let k = pos as usize;
-            let frac = (pos - k as f64) as f32;
-            let (a, b) = (x(k), if k + 1 < total { x(k + 1) } else { x(k) });
-            *y = a + (b - a) * frac;
-        }
+        resample(&channel, step, &mut out[..n]);
         out
+    };
+    let data = std::thread::scope(|s| {
+        let right = s.spawn(|| side(1));
+        [side(0), right.join().expect("resampling thread panicked")]
     });
     Ok(Loaded {
         data,
@@ -54,6 +58,75 @@ pub fn load(path: &Path, rate: f32, frames: usize) -> Result<Loaded, String> {
         truncated: wanted > frames,
         source_rate: spec.sample_rate,
     })
+}
+
+/// Kernel half-width, in zero crossings of the sinc.
+const ZEROS: usize = 16;
+/// Kernel table points per zero crossing.
+const OVERSAMPLE: usize = 512;
+/// Kaiser window shape: about 80 dB of stopband rejection.
+const KAISER_BETA: f64 = 8.0;
+/// Cutoff as a fraction of the lower Nyquist, leaving room for the transition band.
+const ROLLOFF: f64 = 0.95;
+
+/// Fill `out` from `x` read every `step` input samples (input rate / output
+/// rate), band-limited with a Kaiser-windowed sinc. Samples outside `x` are 0.
+/// Equal rates copy exactly.
+pub fn resample(x: &[f32], step: f64, out: &mut [f32]) {
+    if step == 1.0 {
+        let n = out.len().min(x.len());
+        out[..n].copy_from_slice(&x[..n]);
+        out[n..].fill(0.0);
+        return;
+    }
+    // Normalized to the input rate: the lower Nyquist, less the rolloff.
+    let fc = ROLLOFF * (1.0 / step).min(1.0);
+    let half = ZEROS as f64 / fc;
+    let table = kernel_table();
+    let last = x.len() as isize - 1;
+    for (i, y) in out.iter_mut().enumerate() {
+        let t = i as f64 * step;
+        let lo = ((t - half).ceil() as isize).max(0);
+        let hi = ((t + half).floor() as isize).min(last);
+        let mut acc = 0.0f64;
+        for k in lo..=hi {
+            // Distance from the tap, in zero crossings, as a table position.
+            let pos = (t - k as f64).abs() * fc * OVERSAMPLE as f64;
+            let j = pos as usize;
+            if j + 1 >= table.len() {
+                continue;
+            }
+            let w = table[j] + (table[j + 1] - table[j]) * (pos - j as f64);
+            acc += x[k as usize] as f64 * w;
+        }
+        *y = (acc * fc) as f32;
+    }
+}
+
+/// `sinc(d) * kaiser(d / ZEROS)` for `d` in [0, ZEROS], `OVERSAMPLE` points
+/// per zero crossing.
+fn kernel_table() -> Vec<f64> {
+    fn bessel_i0(x: f64) -> f64 {
+        let (mut sum, mut term) = (1.0, 1.0);
+        for k in 1..50 {
+            term *= (x / (2.0 * k as f64)).powi(2);
+            sum += term;
+        }
+        sum
+    }
+    let norm = bessel_i0(KAISER_BETA);
+    (0..=ZEROS * OVERSAMPLE)
+        .map(|j| {
+            let d = j as f64 / OVERSAMPLE as f64;
+            let sinc = if j == 0 {
+                1.0
+            } else {
+                (std::f64::consts::PI * d).sin() / (std::f64::consts::PI * d)
+            };
+            let r = d / ZEROS as f64;
+            sinc * bessel_i0(KAISER_BETA * (1.0 - r * r).max(0.0).sqrt()) / norm
+        })
+        .collect()
 }
 
 /// Write `left` and `right` as a stereo 32-bit float WAV, lossless for
@@ -143,6 +216,43 @@ mod tests {
         assert_eq!(l.source_rate, 44100);
         assert_eq!(&l.data[0][..500], &left[..]);
         assert_eq!(&l.data[1][..500], &right[..]);
+    }
+
+    fn tone(hz: f64, rate: f64, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| (2.0 * std::f64::consts::PI * hz * i as f64 / rate).sin() as f32)
+            .collect()
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn upsampling_reconstructs_a_tone() {
+        let x = tone(1000.0, 24000.0, 2400);
+        let mut out = vec![0.0; 4800];
+        resample(&x, 0.5, &mut out);
+        let want = tone(1000.0, 48000.0, 4800);
+        // Away from the edges, where the kernel runs past the input.
+        let err = (200..4600)
+            .map(|i| (out[i] - want[i]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(err < 1e-3, "max error {err}");
+    }
+
+    #[test]
+    fn downsampling_passes_band_and_rejects_above_nyquist() {
+        let mut out = vec![0.0; 4800];
+        // 10 kHz is inside the 48 kHz output band.
+        resample(&tone(10000.0, 96000.0, 9600), 2.0, &mut out);
+        let pass = rms(&out[200..4600]) / std::f32::consts::FRAC_1_SQRT_2;
+        assert!((pass - 1.0).abs() < 0.01, "10 kHz gain {pass}");
+        // 30 kHz is above the output Nyquist (24 kHz); linear interpolation
+        // would alias it to 18 kHz at nearly full level.
+        resample(&tone(30000.0, 96000.0, 9600), 2.0, &mut out);
+        let alias_db = 20.0 * (rms(&out[200..4600]) / std::f32::consts::FRAC_1_SQRT_2).log10();
+        assert!(alias_db < -70.0, "30 kHz leaks at {alias_db:.1} dB");
     }
 
     #[test]

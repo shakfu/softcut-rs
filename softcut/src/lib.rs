@@ -44,5 +44,6 @@ pub mod rt;
 mod svf;
 mod voice;
 
+pub use dsp::FadeShape;
 pub use engine::{Engine, EngineCmd, EngineConfig, VoiceMix};
 pub use voice::{Quirks, Voice, VoiceCmd};

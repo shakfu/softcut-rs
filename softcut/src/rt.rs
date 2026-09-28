@@ -10,6 +10,39 @@
 //!
 //! The ring has one producer. Hosts with several control sources must
 //! serialize them onto the one `Handle`.
+//!
+//! # Reading settings back
+//!
+//! The [`Voice`](crate::Voice) getters are unavailable on the control thread,
+//! since the voices live in the [`Processor`]. Every setting reaches them
+//! through the one `Handle`, though, so the control thread can keep a shadow
+//! voice: apply each [`VoiceCmd`](crate::VoiceCmd) to a local `Voice` before
+//! sending it, and read settings from the shadow's getters. The shadow
+//! processes no audio; construct it with the same sample rate and
+//! [`Quirks`](crate::Quirks), and `Reset` restores its defaults exactly as on
+//! the audio thread.
+//!
+//! The shadow's playback state goes stale: rec-once ends, and heads move, only
+//! on the audio thread. Read those from [`Handle::rec`], [`Handle::play`] and
+//! [`Handle::position`].
+//!
+//! ```
+//! use softcut::rt;
+//! use softcut::{Engine, EngineCmd, EngineConfig, Voice, VoiceCmd};
+//!
+//! let cfg = EngineConfig { voices: 1, buffers: 1, buffer_frames: 1 << 14, ..Default::default() };
+//! let (mut handle, _processor) = rt::split(Engine::new(cfg), 64);
+//! let mut shadow = Voice::with_quirks(cfg.sample_rate, cfg.quirks);
+//!
+//! let mut set = |cmd: VoiceCmd| {
+//!     shadow.apply(cmd);
+//!     handle.send(EngineCmd::Voice(0, cmd))
+//! };
+//! set(VoiceCmd::Rate(-0.5)).unwrap();
+//! set(VoiceCmd::Reset).unwrap();
+//! assert_eq!(shadow.rate(), 1.0);
+//! assert_eq!(shadow.fade_time(), 0.1); // the upstream quirk, as on the audio thread
+//! ```
 
 use std::fmt;
 use std::sync::Arc;

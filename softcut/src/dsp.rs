@@ -36,48 +36,170 @@ use crate::Quirks;
 const FADE_BUF_SIZE: usize = 1001;
 const FPI: f32 = std::f32::consts::PI;
 
-/// Pre/rec level curves applied across a subhead's crossfade.
+/// Shape of a fade curve. Port of softcut-lib's `FadeCurves::Shape`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FadeShape {
+    #[default]
+    Linear,
+    /// Half a cosine: slow at both ends.
+    Sine,
+    /// A quarter sine: fast at the start, slow at the end.
+    Raised,
+}
+
+/// Pre/rec level curves applied across a subhead's crossfade, as 1001-point
+/// tables over the fade's progress. Port of `FadeCurves.cpp`.
 ///
-/// Only softcut's defaults are built (linear pre window of 1/8, raised rec
-/// curve delayed by 1/128): `softcut::Voice` exposes no setter for the others.
+/// The rec curve scales new input: 0 for the first `rec_delay_ratio` of the
+/// fade, then rising to 1. The pre curve lifts the pre level towards 1 (keep
+/// the old content) over the first `pre_window_ratio`, then 0.
 #[derive(Clone)]
 pub(crate) struct FadeCurves {
     rec: [f32; FADE_BUF_SIZE],
     pre: [f32; FADE_BUF_SIZE],
+    rec_shape: FadeShape,
+    pre_shape: FadeShape,
+    rec_delay_ratio: f32,
+    pre_window_ratio: f32,
+    quirks: Quirks,
 }
 
 impl FadeCurves {
+    /// softcut's defaults: linear pre window of 1/8, raised rec curve delayed
+    /// by 1/128.
     pub(crate) fn new(quirks: Quirks) -> Self {
-        let n = FADE_BUF_SIZE - 1;
-
-        // Rec curve, "raised" shape. NB: upstream computes `-sin(x)`, so the
-        // curve runs 0 -> -1 and recorded material is polarity-inverted.
-        let sign = match quirks {
-            Quirks::Upstream => -1.0,
-            Quirks::Fixed => 1.0,
+        let mut c = Self {
+            rec: [0.0; FADE_BUF_SIZE],
+            pre: [0.0; FADE_BUF_SIZE],
+            rec_shape: FadeShape::Raised,
+            pre_shape: FadeShape::Linear,
+            rec_delay_ratio: 1.0 / 128.0,
+            pre_window_ratio: 1.0 / 8.0,
+            quirks,
         };
-        let mut rec = [0.0f32; FADE_BUF_SIZE];
-        let ndr = ((1.0f32 / 128.0) * FADE_BUF_SIZE as f32) as usize;
+        c.calc_rec();
+        c.calc_pre();
+        c
+    }
+
+    pub(crate) fn set_rec_shape(&mut self, shape: FadeShape) {
+        self.rec_shape = shape;
+        self.calc_rec();
+    }
+
+    pub(crate) fn set_pre_shape(&mut self, shape: FadeShape) {
+        self.pre_shape = shape;
+        self.calc_pre();
+    }
+
+    pub(crate) fn set_rec_delay_ratio(&mut self, x: f32) {
+        self.rec_delay_ratio = x;
+        self.calc_rec();
+    }
+
+    pub(crate) fn set_pre_window_ratio(&mut self, x: f32) {
+        self.pre_window_ratio = x;
+        self.calc_pre();
+    }
+
+    pub(crate) fn rec_shape(&self) -> FadeShape {
+        self.rec_shape
+    }
+
+    pub(crate) fn pre_shape(&self) -> FadeShape {
+        self.pre_shape
+    }
+
+    pub(crate) fn rec_delay_ratio(&self) -> f32 {
+        self.rec_delay_ratio
+    }
+
+    pub(crate) fn pre_window_ratio(&self) -> f32 {
+        self.pre_window_ratio
+    }
+
+    // Table points before the curve starts. Upstream overruns its table for
+    // ratios above 1; clamped here.
+    fn calc_rec(&mut self) {
+        let n = FADE_BUF_SIZE - 1;
+        let ndr = ((self.rec_delay_ratio * FADE_BUF_SIZE as f32) as usize).min(n);
         let nr = n - ndr;
-        let phi = FPI / (nr * 2) as f32;
-        let mut x = 0.0f32;
-        for v in &mut rec[ndr..n] {
-            *v = sign * x.sin();
-            x += phi;
+        let buf = &mut self.rec;
+        buf[..ndr].fill(0.0);
+        let curve = &mut buf[ndr..n];
+        match self.rec_shape {
+            FadeShape::Sine => {
+                let phi = FPI / nr as f32;
+                let mut x = FPI;
+                for v in curve {
+                    *v = x.cos() * 0.5 + 0.5;
+                    x += phi;
+                }
+            }
+            FadeShape::Linear => {
+                let phi = 1.0 / nr as f32;
+                let mut x = 0.0f32;
+                for v in curve {
+                    *v = x;
+                    x += phi;
+                }
+            }
+            FadeShape::Raised => {
+                // NB: upstream computes `-sin(x)`, so the curve runs 0 -> -1
+                // and recorded material is polarity-inverted.
+                let sign = match self.quirks {
+                    Quirks::Upstream => -1.0,
+                    Quirks::Fixed => 1.0,
+                };
+                let phi = FPI / (nr * 2) as f32;
+                let mut x = 0.0f32;
+                for v in curve {
+                    *v = sign * x.sin();
+                    x += phi;
+                }
+            }
         }
-        rec[n] = 1.0;
+        buf[n] = 1.0;
+    }
 
-        // Pre curve, linear shape: 1 -> 0 over the window, then 0.
-        let mut pre = [0.0f32; FADE_BUF_SIZE];
-        let nwp = ((1.0f32 / 8.0) * FADE_BUF_SIZE as f32) as usize;
-        let phi = 1.0 / nwp as f32;
-        let mut x = 0.0f32;
-        for v in &mut pre[..nwp] {
-            *v = 1.0 - x;
-            x += phi;
+    fn calc_pre(&mut self) {
+        // NB: upstream tests the rec shape where it means the pre shape, so a
+        // raised pre curve only applies while the rec curve is also raised;
+        // otherwise the table keeps its previous contents.
+        if self.pre_shape == FadeShape::Raised
+            && self.quirks == Quirks::Upstream
+            && self.rec_shape != FadeShape::Raised
+        {
+            return;
         }
-
-        Self { rec, pre }
+        let nwp = ((self.pre_window_ratio * FADE_BUF_SIZE as f32) as usize).min(FADE_BUF_SIZE);
+        let buf = &mut self.pre;
+        let window = &mut buf[..nwp];
+        let mut x = 0.0f32;
+        match self.pre_shape {
+            FadeShape::Sine => {
+                let phi = FPI / nwp as f32;
+                for v in window {
+                    *v = x.cos() * 0.5 + 0.5;
+                    x += phi;
+                }
+            }
+            FadeShape::Linear => {
+                let phi = 1.0 / nwp as f32;
+                for v in window {
+                    *v = 1.0 - x;
+                    x += phi;
+                }
+            }
+            FadeShape::Raised => {
+                let phi = FPI / (nwp * 2) as f32;
+                for v in window {
+                    *v = x.cos();
+                    x += phi;
+                }
+            }
+        }
+        buf[nwp..].fill(0.0);
     }
 
     #[inline]
@@ -202,6 +324,73 @@ mod tests {
         assert!((c.rec_value(1.0) + 1.0).abs() < 1e-3);
         let fixed = FadeCurves::new(Quirks::Fixed);
         assert!((fixed.rec_value(1.0) - 1.0).abs() < 1e-3);
+    }
+
+    fn monotonic(xs: &[f32], rising: bool) -> bool {
+        xs.windows(2)
+            .all(|w| if rising { w[1] >= w[0] } else { w[1] <= w[0] })
+    }
+
+    #[test]
+    fn every_shape_spans_its_range() {
+        for shape in [FadeShape::Linear, FadeShape::Sine, FadeShape::Raised] {
+            let mut c = FadeCurves::new(Quirks::Fixed);
+            c.set_rec_shape(shape);
+            c.set_pre_shape(shape);
+            let n = FADE_BUF_SIZE - 1;
+            let ndr = ((1.0f32 / 128.0) * FADE_BUF_SIZE as f32) as usize;
+            assert!(
+                c.rec[..ndr].iter().all(|&x| x == 0.0),
+                "{shape:?} rec delay"
+            );
+            assert!(monotonic(&c.rec[..n], true), "{shape:?} rec rises");
+            assert!(
+                c.rec[n - 1] > 0.99,
+                "{shape:?} rec reaches {}",
+                c.rec[n - 1]
+            );
+            let nwp = FADE_BUF_SIZE / 8;
+            assert_eq!(c.pre[0], 1.0, "{shape:?} pre starts at 1");
+            assert!(monotonic(&c.pre, false), "{shape:?} pre falls");
+            assert!(
+                c.pre[nwp..].iter().all(|&x| x == 0.0),
+                "{shape:?} pre window"
+            );
+        }
+    }
+
+    #[test]
+    fn ratios_move_the_curves_and_clamp() {
+        let mut c = FadeCurves::new(Quirks::Fixed);
+        c.set_rec_delay_ratio(0.5);
+        assert_eq!(c.rec[499], 0.0);
+        assert!(c.rec[520] > 0.0);
+        c.set_pre_window_ratio(0.25);
+        assert!(c.pre[240] > 0.0 && c.pre[251] == 0.0);
+        // Upstream overruns its table past 1; here both clamp.
+        c.set_rec_delay_ratio(3.0);
+        c.set_pre_window_ratio(3.0);
+        assert!(c.rec[..FADE_BUF_SIZE - 1].iter().all(|&x| x == 0.0));
+        assert_eq!(c.rec[FADE_BUF_SIZE - 1], 1.0);
+        // The window covers the whole table, so it never reaches 0.
+        let last = c.pre[FADE_BUF_SIZE - 1];
+        assert!(last > 0.0 && last < 0.01, "{last}");
+    }
+
+    #[test]
+    fn raised_pre_shape_follows_upstream_bug_only_with_upstream_quirks() {
+        for (quirks, applies) in [(Quirks::Upstream, false), (Quirks::Fixed, true)] {
+            let mut c = FadeCurves::new(quirks);
+            c.set_rec_shape(FadeShape::Linear);
+            let before = c.pre;
+            c.set_pre_shape(FadeShape::Raised);
+            assert_eq!(c.pre != before, applies, "{quirks:?}");
+        }
+        // With the rec curve raised, upstream applies it too.
+        let mut c = FadeCurves::new(Quirks::Upstream);
+        let before = c.pre;
+        c.set_pre_shape(FadeShape::Raised);
+        assert_ne!(c.pre, before);
     }
 
     #[test]

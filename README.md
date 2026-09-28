@@ -11,7 +11,7 @@ Rust port of [softcut-lib](https://github.com/monome/softcut-lib), the looping e
 
 ## Library
 
-- `Voice`: one crossfaded, resampling read/write head, with pre (input) and post (output) state-variable filters. It holds no buffer; `process_block(&mut buf, input, output)` borrows one per call. Voices share a buffer by being processed in turn.
+- `Voice`: one crossfaded, resampling read/write head, with pre (input) and post (output) state-variable filters. It holds no buffer; `process_block(&mut buf, input, output)` borrows one per call. Voices share a buffer by being processed in turn. The crossfade's rec and pre curves take a `FadeShape` (linear, sine, raised) and a delay/window ratio, as in softcut-lib's `FadeCurves`, which upstream's `Voice` does not expose.
 
 - `Engine`: a multi-voice host. It owns the buffers, and adds per-voice level, pan, input gain and a voice-to-voice feedback matrix (one block of latency). It processes interleaved input of `in_channels` into interleaved output. An input level matrix (`EngineCmd::InputLevel`, norns `level_input_cut`) routes channels to voices; voice `v` starts on channel `v % in_channels`. Stereo, as on norns, is two voices on two buffers, panned apart.
 
@@ -21,7 +21,13 @@ Rust port of [softcut-lib](https://github.com/monome/softcut-lib), the looping e
 
 Neither type allocates after construction, locks, or spawns threads. The host owns threading.
 
-Two upstream quirks are kept by default: recorded material is polarity-inverted (the "raised" rec fade curve computes `-sin(x)`), and `Voice::reset` leaves a 0.1 s fade time, not the 0.01 s it sets. `Quirks::Fixed`, passed to `Voice::with_quirks` or `EngineConfig::quirks`, corrects both. It is a constructor argument, not a Cargo feature: features unify across a dependency graph, so one crate enabling it would change every other crate's output.
+Three upstream quirks are kept by default:
+
+- Recorded material is polarity-inverted. The "raised" rec fade curve computes `-sin(x)`.
+- `Voice::reset` leaves a 0.1 s fade time, not the 0.01 s it sets.
+- A raised pre fade shape only applies while the rec shape is also raised. Upstream tests the rec shape where it means the pre shape.
+
+`Quirks::Fixed`, passed to `Voice::with_quirks` or `EngineConfig::quirks`, corrects all three. It is a constructor argument, not a Cargo feature: features unify across a dependency graph, so one crate enabling it would change every other crate's output.
 
 ```rust
 use softcut::{Engine, EngineCmd, EngineConfig, VoiceCmd};
@@ -66,11 +72,13 @@ while let Some(r) = handle.returned() {
 
 The ring has one producer. Hosts with several control sources must serialize them onto one `Handle`.
 
+To read settings back on the control thread, keep a shadow `Voice` there: apply each `VoiceCmd` to it before sending, and read its getters. The `rt` module docs show the pattern and its limits.
+
 ## Parity with the C++ engine
 
 `softcut/tests/golden.rs` replays 9 scenarios recorded from softcut-lib through softcut-py. The scenarios cover recording, overdub, varispeed in both directions, filters, rec-once, one-shot, phase quantization, engine feedback and buffer operations. Output, buffer contents and head positions match within 1.2e-7. The exception is varispeed with rate slew, at 7.6e-5: clang fuses the slew update into an FMA on arm64 and Rust does not. `make fixtures` regenerates the fixtures; see `scripts/gen_fixtures.py`.
 
-Upstream behaviour kept for parity, besides the two quirks above:
+Upstream behaviour kept for parity, besides the quirks above:
 
 - The input filter's cutoff tracks the rate at the moment it is set, not the rate as it slews.
 
@@ -80,6 +88,8 @@ Deviations, all where upstream behaviour is undefined:
 
 - Rates above 64 clamp the resampler's output frame count. Upstream writes past its 64-frame buffer.
 
+- Fade delay/window ratios above 1 are clamped. Upstream writes past its fade table.
+
 - A non-power-of-two buffer panics. Upstream asserts in debug builds and indexes out of bounds in release builds.
 
 ## Demo
@@ -88,9 +98,9 @@ Deviations, all where upstream behaviour is undefined:
 make demo
 ```
 
-Four voices run over a stereo pair of 43.7 s buffers (at 48 kHz), L and R, as two linked stereo pairs: voices 1+2 and 3+4. Editing one voice of a linked pair applies to both, on opposite buffers with mirrored pan; untick "link" to control them separately. Each voice records the input channel matching its buffer. Voices 1+2 record when you press rec; voices 3+4 play back at half speed, reversed, through a lowpass. The input is the default microphone or off; the mic stream is paused while off, which is the startup state. The engine uses `Quirks::Fixed`, so recordings keep the input's polarity.
+Four voices run over a stereo pair of 43.7 s buffers (at 48 kHz), L and R, as two linked stereo pairs: voices 1+2 and 3+4. Editing one voice of a linked pair applies to both, on opposite buffers with mirrored pan; untick "link" to control them separately. Each voice records the input channel matching its buffer. Voices 1+2 record when you press rec; voices 3+4 play back at half speed, reversed, through a lowpass. The input row picks any recording device (a mic, an interface, a virtual device such as BlackHole) and, on devices with more than two inputs, which channel pair feeds L and R. A mono device feeds both. The input is off at startup, and its stream stays paused while off. The engine uses `Quirks::Fixed`, so recordings keep the input's polarity. "crossfade curves" sets each voice's fade shapes and ratios.
 
-"load wav..." or dropping a file on the window loads a WAV into both buffers: stereo files split L/R, mono files fill both. Files are linearly resampled to the device rate and truncated to fit. Loading stops recording and loops every voice over the file. "save wav..." writes both buffers, over the loaded sample's length, to a stereo 32-bit float WAV. "clear loop" silences the selected voice's loop region; "reverse loop" reverses it in place. The waveform zooms to the sample on load; "fit sample" and "full buffer" switch between the two views. On the waveform, click to cut the selected voice, drag to set its loop. The microphone is opened at the output device's sample rate; if it does not support that rate, it is disabled and the status line says why.
+"load wav..." or dropping a file on the window loads a WAV into both buffers: stereo files split L/R, mono files fill both. Files at another rate are resampled to the device rate with a Kaiser-windowed sinc (cutoff at 95% of the lower Nyquist, about 80 dB stopband), then truncated to fit. Loading stops recording and loops every voice over the file. "save wav..." writes both buffers, over the loaded sample's length, to a stereo 32-bit float WAV. "clear loop" silences the selected voice's loop region; "reverse loop" reverses it in place. The waveform zooms to the sample on load; "fit sample" and "full buffer" switch between the two views. On the waveform, click to cut the selected voice, drag to set its loop. Input devices are opened at the output device's sample rate. A device without that rate cannot be used, since softcut does no rate conversion; the status line says so and the previous input stays open.
 
 ## Development
 

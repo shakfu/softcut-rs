@@ -414,6 +414,14 @@ impl ReadWriteHead {
         self.rate
     }
 
+    pub(crate) fn curves(&self) -> &FadeCurves {
+        &self.curves
+    }
+
+    pub(crate) fn curves_mut(&mut self) -> &mut FadeCurves {
+        &mut self.curves
+    }
+
     pub(crate) fn loop_start_seconds(&self) -> f32 {
         (self.start / self.sr as f64) as f32
     }

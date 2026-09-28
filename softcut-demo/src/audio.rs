@@ -5,11 +5,11 @@
 //! The engine runs a stereo pair of buffers (0 = left, 1 = right) with stereo
 //! input.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rtrb::{Consumer, RingBuffer};
+use rtrb::{Consumer, Producer, RingBuffer};
 use softcut::rt::{self, Handle, Processor};
 use softcut::{Engine, EngineConfig, Quirks};
 
@@ -27,19 +27,48 @@ const MAX_INPUT_BACKLOG: usize = 2048;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Source {
-    Mic,
-    /// Mic stream paused; the engine gets zeros.
+    /// The selected input device.
+    On,
+    /// Input stream paused; the engine gets zeros.
     Off,
 }
 
 impl Source {
     fn from_u8(x: u8) -> Self {
-        if x == Source::Mic as u8 {
-            Source::Mic
+        if x == Source::On as u8 {
+            Source::On
         } else {
             Source::Off
         }
     }
+}
+
+/// A recording device the demo can open.
+pub struct InputDevice {
+    pub name: String,
+    pub is_default: bool,
+    device: cpal::Device,
+}
+
+/// Input devices, default first.
+fn input_devices(host: &cpal::Host) -> Vec<InputDevice> {
+    let default = host.default_input_device().and_then(|d| d.id().ok());
+    let mut devices: Vec<InputDevice> = host
+        .input_devices()
+        .map(|it| {
+            it.map(|device| InputDevice {
+                name: device
+                    .description()
+                    .map(|d| d.name().to_string())
+                    .unwrap_or_else(|_| "unnamed device".into()),
+                is_default: device.id().ok().is_some_and(|id| Some(id) == default),
+                device,
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    devices.sort_by_key(|d| !d.is_default);
+    devices
 }
 
 /// Shared between the UI and the audio thread. f32 values are stored as bits.
@@ -69,33 +98,111 @@ impl Meters {
     }
 }
 
+/// The open input stream and what it was opened with.
+struct Input {
+    stream: cpal::Stream,
+    device: usize,
+    first_channel: usize,
+    channels: usize,
+}
+
 pub struct Audio {
     pub handle: Handle,
     pub meters: Arc<Meters>,
     pub sample_rate: f32,
     pub buffer_seconds: f32,
     pub output_name: String,
-    /// Why the microphone is unavailable, if it is.
+    pub inputs: Vec<InputDevice>,
+    /// Why no input is open, if none is.
     pub input_error: Option<String>,
-    /// Paused unless the source is `Mic`, so the mic is only in use when chosen.
-    input_stream: Option<cpal::Stream>,
+    host: cpal::Host,
+    /// Shared so a newly opened stream takes over the ring the audio thread reads.
+    input_tx: Arc<Mutex<Producer<f32>>>,
+    /// Paused unless the source is `On`, so the device is only in use when chosen.
+    input: Option<Input>,
     _output_stream: cpal::Stream,
 }
 
 impl Audio {
-    /// Switch the input, starting or pausing the mic stream to match.
+    /// Switch the input on or off, starting or pausing its stream to match.
     pub fn set_source(&mut self, s: Source) -> Result<(), String> {
-        if let Some(stream) = &self.input_stream {
+        if let Some(input) = &self.input {
             match s {
-                Source::Mic => stream.play(),
-                Source::Off => stream.pause(),
+                Source::On => input.stream.play(),
+                Source::Off => input.stream.pause(),
             }
             .map_err(|e| e.to_string())?;
-        } else if s == Source::Mic {
+        } else if s == Source::On {
             return Err(self.input_error.clone().unwrap_or_default());
         }
         self.meters.source.store(s as u8, Relaxed);
         Ok(())
+    }
+
+    /// Index into `inputs` of the open device, if one is open.
+    pub fn input_device(&self) -> Option<usize> {
+        self.input.as_ref().map(|i| i.device)
+    }
+
+    /// First channel of the open stereo pair, and the device's channel count.
+    pub fn input_channels(&self) -> (usize, usize) {
+        self.input
+            .as_ref()
+            .map_or((0, 0), |i| (i.first_channel, i.channels))
+    }
+
+    /// Open `inputs[device]`, feeding channels `first_channel` and the one
+    /// after (or the same, on a mono device) to L and R. On failure the
+    /// previous input stays open.
+    pub fn select_input(&mut self, device: usize, first_channel: usize) -> Result<(), String> {
+        let dev = &self.inputs.get(device).ok_or("no such device")?.device;
+        let on = Source::from_u8(self.meters.source.load(Relaxed)) == Source::On;
+        if let Some(old) = &self.input {
+            let _ = old.stream.pause();
+        }
+        let opened = open_input(
+            dev,
+            self.sample_rate as u32,
+            first_channel,
+            self.input_tx.clone(),
+        );
+        match opened {
+            Ok((stream, channels)) => {
+                if on {
+                    stream.play().map_err(|e| e.to_string())?;
+                }
+                self.input = Some(Input {
+                    stream,
+                    device,
+                    first_channel,
+                    channels,
+                });
+                self.input_error = None;
+                Ok(())
+            }
+            Err(e) => {
+                if on && let Some(old) = &self.input {
+                    let _ = old.stream.play();
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Re-enumerate devices, keeping the open one selected if still present.
+    pub fn refresh_inputs(&mut self) {
+        let open = self.input_device().map(|i| self.inputs[i].name.clone());
+        self.inputs = input_devices(&self.host);
+        if let Some(input) = &mut self.input {
+            match self
+                .inputs
+                .iter()
+                .position(|d| Some(&d.name) == open.as_ref())
+            {
+                Some(i) => input.device = i,
+                None => self.input_error = Some("the open device is no longer listed".into()),
+            }
+        }
     }
 }
 
@@ -138,10 +245,7 @@ pub fn start(setup: impl FnOnce(&mut Engine)) -> Result<Audio, String> {
 
     let (handle, processor) = rt::split(engine, 1024);
 
-    let (input_stream, input_rx, input_error) = match open_input(&host, out_cfg.sample_rate()) {
-        Ok((stream, rx)) => (Some(stream), Some(rx), None),
-        Err(e) => (None, None, Some(e)),
-    };
+    let (input_tx, input_rx) = RingBuffer::<f32>::new(MAX_FRAMES * 4);
     let meters = Arc::new(Meters {
         source: AtomicU8::new(Source::Off as u8),
         peaks: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
@@ -168,45 +272,61 @@ pub fn start(setup: impl FnOnce(&mut Engine)) -> Result<Audio, String> {
         .map_err(|e| e.to_string())?;
     stream.play().map_err(|e| e.to_string())?;
 
-    Ok(Audio {
+    let mut audio = Audio {
         handle,
         meters,
         sample_rate,
         buffer_seconds: BUFFER_FRAMES as f32 / sample_rate,
         output_name,
-        input_error,
-        input_stream,
+        inputs: input_devices(&host),
+        input_error: None,
+        host,
+        input_tx: Arc::new(Mutex::new(input_tx)),
+        input: None,
         _output_stream: stream,
-    })
+    };
+    audio.input_error = match audio.inputs.is_empty() {
+        true => Some("no input device".into()),
+        false => audio.select_input(0, 0).err(),
+    };
+    Ok(audio)
 }
 
-/// Opens the default input, paused, at the output's sample rate, forwarding
-/// its first two channels (a mono device fills both) as interleaved frames.
+/// Opens `dev`, paused, at the output's sample rate, forwarding channels
+/// `first` and `first + 1` (or `first` twice on a mono device) as interleaved
+/// frames into `tx`. Returns the stream and the device's channel count.
 /// softcut does no rate conversion on its input.
 fn open_input(
-    host: &cpal::Host,
+    dev: &cpal::Device,
     rate: cpal::SampleRate,
-) -> Result<(cpal::Stream, Consumer<f32>), String> {
-    let dev = host.default_input_device().ok_or("no input device")?;
-    // The default config often runs at another rate than the output (e.g. a
-    // MacBook mic defaults to 48 kHz beside 44.1 kHz speakers), so ask for the
-    // output's rate explicitly.
+    first: usize,
+    tx: Arc<Mutex<Producer<f32>>>,
+) -> Result<(cpal::Stream, usize), String> {
+    // A device's default config often runs at another rate than the output
+    // (e.g. a MacBook mic defaults to 48 kHz beside 44.1 kHz speakers), so
+    // ask for the output's rate explicitly, with as many channels as offered.
     let cfg = dev
         .supported_input_configs()
         .map_err(|e| e.to_string())?
         .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
-        .find_map(|c| c.try_with_sample_rate(rate))
-        .ok_or_else(|| format!("input device has no f32 config at {rate} Hz"))?;
+        .filter_map(|c| c.try_with_sample_rate(rate))
+        .max_by_key(|c| c.channels())
+        .ok_or_else(|| format!("device has no f32 input at {rate} Hz"))?;
     let channels = cfg.channels() as usize;
-    let (mut tx, rx) = RingBuffer::<f32>::new(MAX_FRAMES * 4);
+    if first >= channels {
+        let plural = if channels == 1 { "" } else { "s" };
+        return Err(format!("device has {channels} input channel{plural}"));
+    }
+    let (l, r) = (first, (first + 1).min(channels - 1));
     let stream = dev
         .build_input_stream::<f32, _, _>(
             cfg.config(),
             move |data, _| {
+                // Never blocks: contended only while a switch has two streams open.
+                let Ok(mut tx) = tx.try_lock() else { return };
                 for frame in data.chunks_exact(channels) {
                     // Both samples or neither, so the ring never splits a frame.
-                    let lr = [frame[0], frame[1.min(channels - 1)]];
-                    if tx.push_entire_slice(&lr).is_err() {
+                    if tx.push_entire_slice(&[frame[l], frame[r]]).is_err() {
                         break;
                     }
                 }
@@ -216,12 +336,12 @@ fn open_input(
         )
         .map_err(|e| e.to_string())?;
     stream.pause().map_err(|e| e.to_string())?;
-    Ok((stream, rx))
+    Ok((stream, channels))
 }
 
 struct AudioState {
     processor: Processor,
-    input: Option<Consumer<f32>>,
+    input: Consumer<f32>,
     meters: Arc<Meters>,
     stereo_in: Vec<f32>,
     stereo_out: Vec<f32>,
@@ -255,20 +375,18 @@ impl AudioState {
 
     fn fill_input(&mut self, frames: usize) {
         let buf = &mut self.stereo_in[..frames * 2];
-        // Drain the ring even when the mic is not the source, so it never backs up.
-        let mut got = 0;
-        if let Some(rx) = &mut self.input {
-            // Whole frames only: the producer commits samples in pairs.
-            let excess = rx.slots().saturating_sub(2 * (MAX_INPUT_BACKLOG + frames)) & !1;
-            if excess > 0
-                && let Ok(c) = rx.read_chunk(excess)
-            {
-                c.commit_all();
-            }
-            got = rx.pop_partial_slice(buf).0.len();
+        // Drain the ring even when the input is off, so it never backs up.
+        let rx = &mut self.input;
+        // Whole frames only: the producer commits samples in pairs.
+        let excess = rx.slots().saturating_sub(2 * (MAX_INPUT_BACKLOG + frames)) & !1;
+        if excess > 0
+            && let Ok(c) = rx.read_chunk(excess)
+        {
+            c.commit_all();
         }
+        let got = rx.pop_partial_slice(buf).0.len();
         match Source::from_u8(self.meters.source.load(Relaxed)) {
-            Source::Mic => buf[got..].fill(0.0),
+            Source::On => buf[got..].fill(0.0),
             Source::Off => buf.fill(0.0),
         }
         let peak = buf.iter().fold(0.0f32, |m, x| m.max(x.abs()));

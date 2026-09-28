@@ -1,6 +1,6 @@
 //! One softcut voice. Port of `Voice.cpp`.
 
-use crate::dsp::LogRamp;
+use crate::dsp::{FadeCurves, FadeShape, LogRamp};
 use crate::head::ReadWriteHead;
 use crate::svf::Svf;
 
@@ -38,6 +38,10 @@ pub enum VoiceCmd {
     PostFilterBp(f32),
     PostFilterBr(f32),
     PostFilterDry(f32),
+    RecFadeShape(FadeShape),
+    PreFadeShape(FadeShape),
+    RecDelayRatio(f32),
+    PreWindowRatio(f32),
     CutTo(f32),
     Stop,
     Reset,
@@ -121,6 +125,7 @@ impl Voice {
     /// With [`Quirks::Upstream`] the fade time after reset is 0.1 s: upstream
     /// sets 0.01 s and then the head's own init overrides it.
     pub fn reset(&mut self) {
+        *self.head.curves_mut() = FadeCurves::new(self.quirks);
         self.svf_pre.clear_state();
         self.svf_pre.set_lp_mix(1.0);
         self.svf_pre.set_hp_mix(0.0);
@@ -237,6 +242,10 @@ impl Voice {
             PostFilterBp(x) => self.set_post_filter_bp(x),
             PostFilterBr(x) => self.set_post_filter_br(x),
             PostFilterDry(x) => self.set_post_filter_dry(x),
+            RecFadeShape(s) => self.set_rec_fade_shape(s),
+            PreFadeShape(s) => self.set_pre_fade_shape(s),
+            RecDelayRatio(x) => self.set_rec_delay_ratio(x),
+            PreWindowRatio(x) => self.set_pre_window_ratio(x),
             CutTo(x) => self.cut_to(x),
             Stop => self.stop(),
             Reset => self.reset(),
@@ -393,6 +402,31 @@ impl Voice {
         self.svf_post_dry = x;
     }
 
+    /// Shape of the curve that fades new input in across a crossfade.
+    /// Default [`FadeShape::Raised`].
+    pub fn set_rec_fade_shape(&mut self, shape: FadeShape) {
+        self.head.curves_mut().set_rec_shape(shape);
+    }
+
+    /// Shape of the curve that keeps existing content across a crossfade.
+    /// Default [`FadeShape::Linear`]. With [`Quirks::Upstream`], `Raised` only
+    /// takes effect while the rec shape is also `Raised`, as upstream.
+    pub fn set_pre_fade_shape(&mut self, shape: FadeShape) {
+        self.head.curves_mut().set_pre_shape(shape);
+    }
+
+    /// Fraction of a crossfade before new input starts fading in. Default
+    /// 1/128; clamped to 1.
+    pub fn set_rec_delay_ratio(&mut self, x: f32) {
+        self.head.curves_mut().set_rec_delay_ratio(x);
+    }
+
+    /// Fraction of a crossfade over which existing content is kept. Default
+    /// 1/8; clamped to 1.
+    pub fn set_pre_window_ratio(&mut self, x: f32) {
+        self.head.curves_mut().set_pre_window_ratio(x);
+    }
+
     /// Jump to `sec` with a crossfade.
     pub fn cut_to(&mut self, sec: f32) {
         self.head.cut_to_pos(sec);
@@ -462,6 +496,22 @@ impl Voice {
 
     pub fn phase_offset(&self) -> f32 {
         self.phase_offset / self.sample_rate
+    }
+
+    pub fn rec_fade_shape(&self) -> FadeShape {
+        self.head.curves().rec_shape()
+    }
+
+    pub fn pre_fade_shape(&self) -> FadeShape {
+        self.head.curves().pre_shape()
+    }
+
+    pub fn rec_delay_ratio(&self) -> f32 {
+        self.head.curves().rec_delay_ratio()
+    }
+
+    pub fn pre_window_ratio(&self) -> f32 {
+        self.head.curves().pre_window_ratio()
     }
 
     /// Base cutoff as set; the filter runs at this lowered by rate tracking.
@@ -731,6 +781,66 @@ mod tests {
             v.reset();
             assert_eq!(v.fade_time(), fade, "{quirks:?} after reset");
         }
+    }
+
+    #[test]
+    fn fade_curve_settings_round_trip_and_reset() {
+        let mut v = Voice::new(48000.0);
+        assert_eq!(
+            (v.rec_fade_shape(), v.pre_fade_shape()),
+            (FadeShape::Raised, FadeShape::Linear)
+        );
+        assert_eq!(
+            (v.rec_delay_ratio(), v.pre_window_ratio()),
+            (1.0 / 128.0, 1.0 / 8.0)
+        );
+        v.apply(VoiceCmd::RecFadeShape(FadeShape::Sine));
+        v.apply(VoiceCmd::PreFadeShape(FadeShape::Sine));
+        v.apply(VoiceCmd::RecDelayRatio(0.25));
+        v.apply(VoiceCmd::PreWindowRatio(0.5));
+        assert_eq!(
+            (v.rec_fade_shape(), v.pre_fade_shape()),
+            (FadeShape::Sine, FadeShape::Sine)
+        );
+        assert_eq!((v.rec_delay_ratio(), v.pre_window_ratio()), (0.25, 0.5));
+        v.reset();
+        assert_eq!(
+            (v.rec_fade_shape(), v.pre_fade_shape()),
+            (FadeShape::Raised, FadeShape::Linear)
+        );
+        assert_eq!(
+            (v.rec_delay_ratio(), v.pre_window_ratio()),
+            (1.0 / 128.0, 1.0 / 8.0)
+        );
+    }
+
+    /// The rec delay changes what a crossfade writes, and only during it.
+    #[test]
+    fn rec_delay_ratio_changes_what_a_crossfade_records() {
+        let record = |ratio: f32| {
+            let mut v = Voice::with_quirks(48000.0, Quirks::Fixed);
+            v.set_rec_delay_ratio(ratio);
+            let mut buf = vec![0.0; 1 << 14];
+            v.set_fade_time(0.05);
+            v.set_loop_end(0.2);
+            v.set_loop(true);
+            v.set_rec_level(1.0);
+            v.set_rec(true);
+            v.set_play(true);
+            v.cut_to(0.0);
+            let mut out = [0.0; 6000];
+            v.process_block(&mut buf, &[0.25; 6000], &mut out);
+            buf
+        };
+        let (short, long) = (record(1.0 / 128.0), record(0.9));
+        let diff = |r: std::ops::Range<usize>| {
+            r.map(|i| (short[i] - long[i]).abs()).fold(0.0f32, f32::max)
+        };
+        // The fade lasts 2400 frames; after it, both write nearly the same.
+        // Not exactly: the table lookup stops one point short of the curve's
+        // end (upstream), so a steeper curve ends at 0.99988, not 1.
+        assert!(diff(0..2400) > 0.05, "{}", diff(0..2400));
+        assert!(diff(3000..5900) < 1e-3, "{}", diff(3000..5900));
     }
 
     #[test]
