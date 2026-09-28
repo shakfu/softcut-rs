@@ -6,40 +6,18 @@
 
 ## High
 
-- [x] Verify the demo by hand: mic input and the level meter, the file dialog, WAV drag-and-drop, and the waveform zoom. None of it has been seen or heard running.
-
 ## Medium
+
+- [ ] Demo: add randomization
 
 ## Low
 
-- [ ] Demo: resample input from devices that lack the output's sample rate (e.g. a 48 kHz-only device beside 44.1 kHz speakers), instead of refusing them.
+- [ ] Demo: verify system-audio capture with the permission granted. Here the loopback stream delivers frames but exact silence, even while a sound plays, which fits a missing System Audio Recording permission.
 
-- [ ] Demo: system-audio capture. cpal 0.18 opens an output device as a loopback input on macOS 14.6+, but a probe here built the stream and received no callbacks, likely because an unbundled binary cannot request the System Audio Recording permission.
+- [ ] Demo: drift correction for resampled input: steer the resampling ratio from the input ring's fill level, instead of dropping or padding frames.
 
-- [ ] Demo: output device selection. The output stream's callback owns the engine, so switching needs a handover.
+- [ ] Demo: output devices without the engine's sample rate (resample the output, or rebuild the engine at the new rate).
 
 - [ ] Publish voice settings through `rt`, only if a host with several control sources needs them. Until then a shadow `Voice` on the control thread covers it (documented in `rt`).
 
 - [ ] OSC control, and a layer mirroring the norns Lua API. Only needed to run existing norns scripts.
-
-## Done
-
-- [x] Buffer replacement from another thread: `Engine::replace_buffer`, `rt::Handle::load` and `Handle::returned`.
-
-- [x] CI workflow on Linux, Windows and macOS, mirroring `make test` and `make lint`.
-
-- [x] `Voice` getters for every setting, read from DSP state.
-
-- [x] Demo: mic input can be switched off; the mic stream is paused unless selected.
-
-- [x] Upstream quirks switchable: `Quirks::Fixed` (a constructor argument; a Cargo feature would unify across the dependency graph).
-
-- [x] Stereo: multichannel engine input with a channel-to-voice level matrix; demo runs two linked stereo pairs over L/R buffers.
-
-- [x] norns buffer operations (`softcut::buffer`, `ClearRegion`/`CopyRegion`, `rt::Handle::write`/`snapshot`), and WAV save in the demo.
-
-- [x] Windowed-sinc resampling for WAV loads in the demo.
-
-- [x] Fade-curve shapes and ratios on `Voice`, with the upstream raised-pre bug under `Quirks::Upstream`.
-
-- [x] Demo: input device and channel-pair selection.

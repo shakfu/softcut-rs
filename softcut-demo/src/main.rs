@@ -10,6 +10,7 @@
 #![allow(clippy::needless_range_loop)]
 
 mod audio;
+mod resample;
 mod wav;
 
 use std::path::{Path, PathBuf};
@@ -188,6 +189,16 @@ struct App {
     /// Seconds from the buffer start shown on the waveform.
     view_len: f32,
     saving: Option<PendingSave>,
+    /// While the input is on: since when it has delivered no signal.
+    stall: Option<Stall>,
+}
+
+/// Input counters as of the last time the input carried signal.
+struct Stall {
+    since: f64,
+    frames: u64,
+    signal: u64,
+    reported: bool,
 }
 
 impl App {
@@ -598,9 +609,10 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("input");
             let current = self.audio.input_device();
-            let label = |d: &InputDevice| match d.is_default {
-                true => format!("{} (default)", d.name),
-                false => d.name.clone(),
+            let label = |d: &InputDevice| match (d.loopback, d.is_default) {
+                (true, _) => format!("system audio: {}", d.name),
+                (false, true) => format!("{} (default)", d.name),
+                (false, false) => d.name.clone(),
             };
             let mut device_pick = None;
             egui::ComboBox::from_id_salt("input device")
@@ -632,10 +644,10 @@ impl App {
             }
             if ui
                 .button("refresh")
-                .on_hover_text("list input devices again, e.g. after plugging one in")
+                .on_hover_text("list devices again, e.g. after plugging one in")
                 .clicked()
             {
-                self.audio.refresh_inputs();
+                self.audio.refresh_devices();
             }
             let switch = match (device_pick, channel_pick) {
                 (Some(d), _) => Some((d, 0)),
@@ -643,11 +655,7 @@ impl App {
                 _ => None,
             };
             if let Some((device, first)) = switch {
-                let name = self.audio.inputs[device].name.clone();
-                self.status = match self.audio.select_input(device, first) {
-                    Ok(()) => format!("input: {name}"),
-                    Err(e) => format!("{name}: {e}"),
-                };
+                self.status = self.switch_input(device, first);
             }
 
             let old = self.source;
@@ -663,7 +671,101 @@ impl App {
                 self.source = old;
             }
             self.input_meter(ui);
+
+            ui.separator();
+            ui.label("output");
+            let current = self.audio.output_device();
+            let mut pick = None;
+            egui::ComboBox::from_id_salt("output device")
+                .width(200.0)
+                .selected_text(self.audio.output_name())
+                .show_ui(ui, |ui| {
+                    for (i, d) in self.audio.outputs.iter().enumerate() {
+                        let text = match d.is_default {
+                            true => format!("{} (default)", d.name),
+                            false => d.name.clone(),
+                        };
+                        if ui.selectable_label(current == Some(i), text).clicked() {
+                            pick = Some(i);
+                        }
+                    }
+                });
+            if let Some(i) = pick {
+                let name = self.audio.outputs[i].name.clone();
+                self.status = match self.audio.select_output(i) {
+                    Ok(()) => format!("output: {name}"),
+                    Err(e) => format!("{name}: {e}"),
+                };
+            }
         });
+    }
+
+    /// Open an input and describe the result for the status line.
+    fn switch_input(&mut self, device: usize, first: usize) -> String {
+        let name = self.audio.inputs[device].name.clone();
+        if let Err(e) = self.audio.select_input(device, first) {
+            return format!("{name}: {e}");
+        }
+        self.stall = None;
+        let mut status = format!("input: {name}");
+        if let Some(rate) = self.audio.input_rate()
+            && rate as f32 != self.audio.sample_rate
+        {
+            status += &format!(", resampled from {rate} Hz");
+        }
+        if self.audio.inputs[device].loopback {
+            status += ". Captures everything playing on this device, softcut included: \
+                       recording it while softcut plays feeds back";
+        }
+        status
+    }
+
+    /// While the input is on, report once if it has delivered nothing, or
+    /// only exact silence, for 2 s.
+    fn check_input_arriving(&mut self, now: f64) {
+        if self.source != Source::On {
+            self.stall = None;
+            return;
+        }
+        let (frames, signal) = (
+            self.audio.meters.input_frames(),
+            self.audio.meters.input_signal(),
+        );
+        let st = match &mut self.stall {
+            Some(st) if st.signal == signal => st,
+            _ => {
+                self.stall = Some(Stall {
+                    since: now,
+                    frames,
+                    signal,
+                    reported: false,
+                });
+                return;
+            }
+        };
+        if st.reported || now - st.since < 2.0 {
+            return;
+        }
+        st.reported = true;
+        if frames == st.frames {
+            self.status = "no audio is arriving from the input".into();
+            return;
+        }
+        let loopback = self
+            .audio
+            .input_device()
+            .is_some_and(|i| self.audio.inputs[i].loopback);
+        self.status = "the input is exactly silent".into();
+        if cfg!(target_os = "macos") {
+            let permission = match loopback {
+                true => "Screen & System Audio Recording",
+                false => "Microphone",
+            };
+            self.status += &format!(
+                ". If sound should be there, macOS is withholding it: grant your terminal \
+                 access in System Settings > Privacy & Security > {permission}"
+            );
+        }
     }
 
     fn feedback_matrix(&mut self, ui: &mut egui::Ui) {
@@ -699,6 +801,7 @@ impl eframe::App for App {
             self.voices[i].rec = self.audio.handle.rec(i);
         }
         self.collect_returned();
+        self.check_input_arriving(ui.input(|i| i.time));
         let dropped = ui
             .ctx()
             .input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
@@ -770,7 +873,7 @@ impl eframe::App for App {
             ui.label(format!(
                 "{} @ {} Hz, buffers 2 x {:.1} s. Waveform: click to cut voice {}, drag to set its \
                  loop. Thick playhead = recording. Drop a WAV on the window to load it.",
-                self.audio.output_name,
+                self.audio.output_name(),
                 self.audio.sample_rate,
                 self.audio.buffer_seconds,
                 self.selected + 1
@@ -824,6 +927,7 @@ fn main() -> eframe::Result {
         sample_seconds: None,
         view_len: full,
         saving: None,
+        stall: None,
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 680.0]),
