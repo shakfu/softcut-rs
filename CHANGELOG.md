@@ -13,12 +13,17 @@ First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-li
 - `Voice`: softcut-lib's voice, with crossfaded, resampling read/write heads and pre/post filters. It borrows its buffer on each `process_block` call rather than storing a pointer, so voices share a buffer without `unsafe`. Getters read DSP state, so they report what the voice does rather than the last value set.
 - `Engine`: a multi-voice host that owns the buffers, with level, pan, input gain, a feedback matrix, and multichannel input routed by a channel-to-voice level matrix.
 - `VoiceCmd` and `EngineCmd`: `Copy` commands for queueing changes to the audio thread.
+- `Engine::process_with` and `rt::Processor::process_with`: a per-voice insert on each voice's output before pan and mix. It is a closure rather than an effect the engine owns, so nothing needs handing to or freeing on the audio thread. Voice-to-voice feedback carries the processed signal.
 - `Quirks`: `Upstream` (the default) reproduces softcut-lib; `Fixed` corrects its polarity inversion, its 0.1 s fade after reset, and its raised pre-curve check. It is a constructor argument rather than a Cargo feature, because a feature enabled anywhere in a dependency graph would change every crate's output.
 - Fade-curve shapes and ratios on `Voice`. softcut-lib implements them but its `Voice` does not expose them.
 - `Voice::heads` (both crossfading heads' position, fade and gain) and `rec_fade_value`/`pre_fade_value`, for visualizing crossfades; `rt::Handle::heads` publishes the heads.
 - `buffer`: norns buffer operations (write, clear, copy) on slices, and `EngineCmd::ClearRegion` and `CopyRegion` to run them on the audio thread. Copies within one buffer need no temporary; a reversed copy between partly overlapping regions is refused rather than allocating.
 - `rt` (feature `rtrb`): a `Handle` for the control thread and a `Processor` for the audio thread. Commands, buffer loads, writes and snapshots share one ring, so they apply in the order sent. Every buffer sent comes back to the control thread, so the audio thread never frees memory.
 - Golden tests against softcut-lib, run through softcut-py. The README's "Parity with the C++ engine" section gives tolerances and deviations. A separate test checks that faded loop wraps, in playback and overdub, add no click.
+
+#### softcut-fx
+
+- A `Chain` of saturation, bitcrusher, chorus, delay and reverb (Freeverb), mono or stereo, each switchable, driven by `FxCmd`. It allocates only when created. The delay glides between times in f64: in f32 the glide stalls short of its target, by about 9 frames at 2 s, leaving a fractional delay that dulls the echo.
 
 #### softcut-osc
 
@@ -34,6 +39,7 @@ First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-li
 - Four voices as two linked stereo pairs over L and R buffers, with waveform lanes showing loops and playheads, per-voice controls and a feedback matrix.
 - WAV load with windowed-sinc resampling, saving the selected voice's loop region as a 32-bit float WAV (stereo for a linked pair), and loop clear and reverse.
 - Output recording: the mix of all voices to a stereo 32-bit float WAV, written by a separate thread so the audio thread does no file I/O.
+- Effects: a mono chain on each voice and a stereo chain on the mix.
 - Crossfade visualization: fade curves on each loop band, both heads drawn at their gain, and a plot of the rec and pre curves.
 - OSC control, with the controls following OSC changes.
 - Randomization of rate, loop region, pan and level, and filter, per voice or for all voices, once or on a timer. Rates are drawn from octaves and fifths so results stay in tune.

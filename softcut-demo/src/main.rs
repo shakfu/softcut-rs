@@ -16,10 +16,11 @@ mod wav;
 
 use std::path::{Path, PathBuf};
 
-use audio::{Audio, BUFFER_FRAMES, BUFFERS, InputDevice, Source, VOICES, WAVE_BINS};
+use audio::{Audio, BUFFER_FRAMES, BUFFERS, FxTarget, InputDevice, Source, VOICES, WAVE_BINS};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use softcut::rt::Returned;
 use softcut::{Engine, EngineCmd, FadeShape, Quirks, Voice, VoiceCmd};
+use softcut_fx::{Fx, FxCmd};
 use softcut_osc::{Action, PhasePoll};
 
 const COLORS: [Color32; VOICES] = [
@@ -452,6 +453,159 @@ fn loop_save_plan(v: &VoiceUi, linked: bool, sample_rate: f32) -> (usize, usize,
     (a.min(b), a.max(b), buffers)
 }
 
+/// The UI's copy of an effects chain's settings; defaults match
+/// `softcut_fx::Chain::new`, with every effect off.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct FxUi {
+    on: [bool; 5],
+    drive: f32,
+    level: f32,
+    bits: f32,
+    downsample: f32,
+    crush_mix: f32,
+    chorus_rate: f32,
+    chorus_depth: f32,
+    chorus_mix: f32,
+    delay_time: f32,
+    delay_feedback: f32,
+    delay_damp: f32,
+    delay_mix: f32,
+    reverb_size: f32,
+    reverb_damp: f32,
+    reverb_width: f32,
+    reverb_mix: f32,
+}
+
+impl Default for FxUi {
+    fn default() -> Self {
+        Self {
+            on: [false; 5],
+            drive: 6.0,
+            level: -3.0,
+            bits: 8.0,
+            downsample: 4.0,
+            crush_mix: 1.0,
+            chorus_rate: 0.5,
+            chorus_depth: 3.0,
+            chorus_mix: 0.5,
+            delay_time: 0.375,
+            delay_feedback: 0.4,
+            delay_damp: 0.3,
+            delay_mix: 0.35,
+            reverb_size: 0.7,
+            reverb_damp: 0.5,
+            reverb_width: 1.0,
+            reverb_mix: 0.3,
+        }
+    }
+}
+
+impl FxUi {
+    /// Commands that take a chain from `old` to `self`.
+    fn diff(&self, old: &Self) -> Vec<FxCmd> {
+        use FxCmd::*;
+        let mut out = Vec::new();
+        for fx in Fx::ALL {
+            let k = fx as usize;
+            if self.on[k] != old.on[k] {
+                out.push(Enable(fx, self.on[k]));
+            }
+        }
+        // (new value, old value, command setting it)
+        type Setting = (f32, f32, fn(f32) -> FxCmd);
+        let pairs: [Setting; 16] = [
+            (self.drive, old.drive, Drive),
+            (self.level, old.level, Level),
+            (self.bits, old.bits, Bits),
+            (self.downsample, old.downsample, Downsample),
+            (self.crush_mix, old.crush_mix, CrushMix),
+            (self.chorus_rate, old.chorus_rate, ChorusRate),
+            (self.chorus_depth, old.chorus_depth, ChorusDepth),
+            (self.chorus_mix, old.chorus_mix, ChorusMix),
+            (self.delay_time, old.delay_time, DelayTime),
+            (self.delay_feedback, old.delay_feedback, DelayFeedback),
+            (self.delay_damp, old.delay_damp, DelayDamp),
+            (self.delay_mix, old.delay_mix, DelayMix),
+            (self.reverb_size, old.reverb_size, ReverbSize),
+            (self.reverb_damp, old.reverb_damp, ReverbDamp),
+            (self.reverb_width, old.reverb_width, ReverbWidth),
+            (self.reverb_mix, old.reverb_mix, ReverbMix),
+        ];
+        out.extend(
+            pairs
+                .into_iter()
+                .filter(|(a, b, _)| a != b)
+                .map(|(a, _, cmd)| cmd(a)),
+        );
+        out
+    }
+}
+
+/// Controls for one effects chain, in processing order.
+fn fx_controls(ui: &mut egui::Ui, fx: &mut FxUi, id: &str) {
+    use egui::Slider;
+    let section =
+        |ui: &mut egui::Ui, on: &mut bool, name: &str, body: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.checkbox(on, name);
+            if *on {
+                ui.indent((id, name), |ui| body(ui));
+            }
+        };
+    let [sat, crush, chorus, delay, reverb] = &mut fx.on;
+    section(ui, sat, "saturation", &mut |ui| {
+        ui.add(
+            Slider::new(&mut fx.drive, 0.0..=36.0)
+                .text("drive")
+                .suffix(" dB"),
+        );
+        ui.add(
+            Slider::new(&mut fx.level, -24.0..=6.0)
+                .text("level")
+                .suffix(" dB"),
+        );
+    });
+    section(ui, crush, "bitcrusher", &mut |ui| {
+        ui.add(Slider::new(&mut fx.bits, 1.0..=16.0).text("bits"));
+        ui.add(
+            Slider::new(&mut fx.downsample, 1.0..=32.0)
+                .logarithmic(true)
+                .text("downsample"),
+        );
+        ui.add(Slider::new(&mut fx.crush_mix, 0.0..=1.0).text("mix"));
+    });
+    section(ui, chorus, "chorus", &mut |ui| {
+        ui.add(
+            Slider::new(&mut fx.chorus_rate, 0.05..=5.0)
+                .logarithmic(true)
+                .text("rate")
+                .suffix(" Hz"),
+        );
+        ui.add(
+            Slider::new(&mut fx.chorus_depth, 0.0..=10.0)
+                .text("depth")
+                .suffix(" ms"),
+        );
+        ui.add(Slider::new(&mut fx.chorus_mix, 0.0..=1.0).text("mix"));
+    });
+    section(ui, delay, "delay", &mut |ui| {
+        ui.add(
+            Slider::new(&mut fx.delay_time, 0.01..=2.0)
+                .logarithmic(true)
+                .text("time")
+                .suffix(" s"),
+        );
+        ui.add(Slider::new(&mut fx.delay_feedback, 0.0..=0.95).text("feedback"));
+        ui.add(Slider::new(&mut fx.delay_damp, 0.0..=1.0).text("damping"));
+        ui.add(Slider::new(&mut fx.delay_mix, 0.0..=1.0).text("mix"));
+    });
+    section(ui, reverb, "reverb", &mut |ui| {
+        ui.add(Slider::new(&mut fx.reverb_size, 0.0..=1.0).text("size"));
+        ui.add(Slider::new(&mut fx.reverb_damp, 0.0..=1.0).text("damping"));
+        ui.add(Slider::new(&mut fx.reverb_width, 0.0..=1.0).text("width"));
+        ui.add(Slider::new(&mut fx.reverb_mix, 0.0..=1.0).text("mix"));
+    });
+}
+
 /// A save waiting for both buffers' snapshots to come back.
 struct PendingSave {
     path: PathBuf,
@@ -490,6 +644,9 @@ struct App {
     last_random: f64,
     osc: Option<softcut_osc::Server>,
     osc_port: u16,
+    /// Effects: a mono insert per voice, and a stereo chain on the mix.
+    voice_fx: [FxUi; VOICES],
+    master_fx: FxUi,
     phase_poll: PhasePoll,
 }
 
@@ -932,6 +1089,12 @@ impl App {
                 ui.add(egui::Slider::new(&mut v.pre_window_ratio, 0.0..=1.0).text("pre window"))
                     .on_hover_text("fraction of the crossfade over which existing content is kept");
                 fade_curve_plot(ui, v, sr, COLORS[i]);
+            });
+        egui::CollapsingHeader::new("effects")
+            .id_salt("voice fx")
+            .show(ui, |ui| {
+                ui.label("mono, before pan; feedback to other voices carries it");
+                fx_controls(ui, &mut self.voice_fx[i], "voice fx");
             });
 
         for t in self.targets(i) {
@@ -1444,6 +1607,7 @@ impl eframe::App for App {
         // are not mirrored across linked pairs.
         self.drain_osc();
         let before = self.voices;
+        let fx_before = (self.voice_fx, self.master_fx);
         let now = ui.input(|i| i.time);
         if self.auto_random && now - self.last_random >= self.auto_seconds as f64 {
             self.randomize(None, now);
@@ -1517,6 +1681,12 @@ impl eframe::App for App {
             ui.label(&self.status);
             ui.add_space(6.0);
             self.waveform(ui);
+            egui::CollapsingHeader::new("master effects")
+                .id_salt("master fx")
+                .show(ui, |ui| {
+                    ui.label("stereo, on the mix of all voices; recorded output includes it");
+                    fx_controls(ui, &mut self.master_fx, "master fx");
+                });
             ui.add_space(6.0);
             ui.label(format!(
                 "{} @ {} Hz, buffers 2 x {:.1} s. Waveform: click to cut voice {}, drag to set its \
@@ -1531,6 +1701,17 @@ impl eframe::App for App {
         let s = self.selected;
         if self.linked[s / 2] && self.voices[s] != before[s] {
             self.voices[s ^ 1] = self.voices[s].partner();
+        }
+        if self.linked[s / 2] && self.voice_fx[s] != fx_before.0[s] {
+            self.voice_fx[s ^ 1] = self.voice_fx[s];
+        }
+        for v in 0..VOICES {
+            for cmd in self.voice_fx[v].diff(&fx_before.0[v]) {
+                self.audio.send_fx(FxTarget::Voice(v), cmd);
+            }
+        }
+        for cmd in self.master_fx.diff(&fx_before.1) {
+            self.audio.send_fx(FxTarget::Master, cmd);
         }
         let mut cmds = Vec::new();
         for i in 0..VOICES {
@@ -1593,6 +1774,8 @@ impl App {
             last_random: 0.0,
             osc: None,
             osc_port: 9999,
+            voice_fx: [FxUi::default(); VOICES],
+            master_fx: FxUi::default(),
             phase_poll: PhasePoll::new(VOICES),
         }
     }
@@ -1807,5 +1990,23 @@ mod tests {
             ..v
         };
         assert_eq!(loop_save_plan(&reversed, false, 1000.0).0, 1000);
+    }
+
+    #[test]
+    fn fx_diff_sends_only_changes() {
+        let old = FxUi::default();
+        assert!(old.diff(&old).is_empty());
+        let mut new = old;
+        new.on[Fx::Delay as usize] = true;
+        new.delay_time = 0.5;
+        new.reverb_mix = 0.1;
+        assert_eq!(
+            new.diff(&old),
+            vec![
+                FxCmd::Enable(Fx::Delay, true),
+                FxCmd::DelayTime(0.5),
+                FxCmd::ReverbMix(0.1)
+            ]
+        );
     }
 }

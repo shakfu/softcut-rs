@@ -179,6 +179,19 @@ impl Engine {
     /// # Panics
     /// If `input` is not whole frames, or `output` has a different frame count.
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) {
+        self.process_with(input, output, |_, _| {});
+    }
+
+    /// [`process`](Self::process), running `insert(voice, block)` on each
+    /// voice's mono output before it is panned into the mix: a per-voice
+    /// effects insert. The voice-to-voice feedback carries the processed
+    /// block. `insert` must be realtime-safe.
+    pub fn process_with(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+        mut insert: impl FnMut(usize, &mut [f32]),
+    ) {
         let (ic, oc) = (self.in_channels, self.out_channels);
         assert_eq!(
             input.len() % ic,
@@ -194,11 +207,16 @@ impl Engine {
             .chunks(self.block_size * ic)
             .zip(output.chunks_mut(self.block_size * oc))
         {
-            self.process_chunk(cin, cout);
+            self.process_chunk(cin, cout, &mut insert);
         }
     }
 
-    fn process_chunk(&mut self, input: &[f32], out: &mut [f32]) {
+    fn process_chunk(
+        &mut self,
+        input: &[f32],
+        out: &mut [f32],
+        insert: &mut impl FnMut(usize, &mut [f32]),
+    ) {
         let (n, bs, ic, ch) = (
             self.voices.len(),
             self.block_size,
@@ -233,6 +251,7 @@ impl Engine {
             }
             let o = &mut self.cur_out[dst * bs..dst * bs + frames];
             self.voices[dst].process_block(&mut self.buffers[m.buffer], voice_in, o);
+            insert(dst, o);
 
             let theta = (m.pan * 0.5 + 0.5) * std::f32::consts::FRAC_PI_2;
             let (gl, gr) = (m.level * theta.cos(), m.level * theta.sin());
@@ -631,6 +650,64 @@ mod tests {
             preserve: 0.0,
         });
         assert!(e.buffers()[0][4000..].iter().all(|&x| x == 0.0));
+    }
+
+    /// An insert processes each voice before the mix, and feedback carries
+    /// its result.
+    #[test]
+    fn insert_runs_per_voice_before_mix_and_feedback() {
+        let mut e = small(2);
+        e.buffer_mut(0).fill(0.25);
+        for v in 0..2 {
+            e.apply(EngineCmd::Voice(v, VoiceCmd::LoopEnd(1.0)));
+            e.apply(EngineCmd::Voice(v, VoiceCmd::Loop(true)));
+            e.apply(EngineCmd::Pan(v, -1.0));
+        }
+        e.apply(EngineCmd::Voice(0, VoiceCmd::Play(true)));
+        let mut out = vec![0.0; 256 * 2];
+        let mut seen = [0usize; 2];
+        // Silence voice 0 in its insert: nothing reaches the mix.
+        e.process_with(&[0.0; 256], &mut out, |v, block| {
+            seen[v] += block.len();
+            if v == 0 {
+                block.fill(0.0);
+            }
+        });
+        assert_eq!(seen, [256, 256]);
+        assert!(out.iter().all(|&x| x == 0.0));
+        // Voice 0 feeds voice 1, which records it. With voice 0 silenced in
+        // the insert, voice 1 records nothing.
+        e.apply(EngineCmd::Feedback {
+            src: 0,
+            dst: 1,
+            amount: 1.0,
+        });
+        e.apply(EngineCmd::InputGain(1, 0.0));
+        e.apply(EngineCmd::VoiceBuffer(1, 0));
+        for c in [
+            VoiceCmd::RecLevel(1.0),
+            VoiceCmd::Rec(true),
+            VoiceCmd::LoopStart(0.8),
+            VoiceCmd::LoopEnd(1.2),
+            VoiceCmd::CutTo(0.8),
+        ] {
+            e.apply(EngineCmd::Voice(1, c));
+        }
+        for _ in 0..40 {
+            e.process_with(&[0.0; 256], &mut out, |v, block| {
+                if v == 0 {
+                    block.fill(0.0);
+                }
+            });
+        }
+        // The buffer held 0.25 there. Past the 0.1 s crossfade (4800 frames),
+        // voice 1 has overwritten it with what the insert passed: silence.
+        let at = (0.8 * 48000.0) as usize;
+        let region = &e.buffers()[0][at + 5500..at + 9500];
+        assert!(
+            region.iter().all(|&x| x == 0.0),
+            "feedback bypassed the insert"
+        );
     }
 
     #[test]

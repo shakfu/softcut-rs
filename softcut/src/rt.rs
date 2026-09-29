@@ -332,6 +332,23 @@ impl Processor {
     /// Apply queued messages, process, publish state. Arguments as for
     /// [`Engine::process`].
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) {
+        self.process_with(input, output, |_, _| {});
+    }
+
+    /// [`process`](Self::process) with a per-voice insert, as
+    /// [`Engine::process_with`].
+    pub fn process_with(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+        insert: impl FnMut(usize, &mut [f32]),
+    ) {
+        self.apply_pending();
+        self.engine.process_with(input, output, insert);
+        self.publish();
+    }
+
+    fn apply_pending(&mut self) {
         while let Ok(msg) = self.rx.peek() {
             // A buffer message needs somewhere to send its buffer back;
             // without it, stop here and keep the queue's order.
@@ -379,8 +396,6 @@ impl Processor {
             };
             let _ = self.spent.push(back);
         }
-        self.engine.process(input, output);
-        self.publish();
     }
 
     /// For reading buffers or voice state on the audio thread.

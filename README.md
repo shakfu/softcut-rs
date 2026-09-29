@@ -7,6 +7,7 @@ Rust port of [softcut-lib](https://github.com/monome/softcut-lib), the looping e
 | Crate | Purpose | Dependencies |
 |-|-|-|
 | `softcut` | The DSP library, for embedding in a Rust audio host | none; `rtrb` optional |
+| `softcut-fx` | Built-in effects: saturation, bitcrusher, chorus, delay, reverb | none |
 | `softcut-osc` | OSC control over softcut-lib's `softcut_jack_osc` protocol | softcut, rosc |
 | `softcut-demo` | egui app: stereo live looping with the buffers, loops and playheads drawn | cpal, eframe, rtrb, hound, rfd, softcut-osc |
 
@@ -14,7 +15,7 @@ Rust port of [softcut-lib](https://github.com/monome/softcut-lib), the looping e
 
 - `Voice`: one crossfaded, resampling read/write head, with pre (input) and post (output) state-variable filters. It holds no buffer; `process_block(&mut buf, input, output)` borrows one per call. Voices share a buffer by being processed in turn. The crossfade's rec and pre curves take a `FadeShape` (linear, sine, raised) and a delay/window ratio, as in softcut-lib's `FadeCurves`, which upstream's `Voice` does not expose. `heads()` reports both crossfading heads' position, fade and gain, and `rec_fade_value`/`pre_fade_value` sample the curves, for visualizing them.
 
-- `Engine`: a multi-voice host. It owns the buffers, and adds per-voice level, pan, input gain and a voice-to-voice feedback matrix (one block of latency). It processes interleaved input of `in_channels` into interleaved output. An input level matrix (`EngineCmd::InputLevel`, norns `level_input_cut`) routes channels to voices; voice `v` starts on channel `v % in_channels`. Stereo, as on norns, is two voices on two buffers, panned apart.
+- `Engine`: a multi-voice host. It owns the buffers, and adds per-voice level, pan, input gain and a voice-to-voice feedback matrix (one block of latency). It processes interleaved input of `in_channels` into interleaved output. `process_with` takes a per-voice insert, `|voice, block|`, run on each voice's mono output before pan and mix; voice-to-voice feedback carries the processed block. An input level matrix (`EngineCmd::InputLevel`, norns `level_input_cut`) routes channels to voices; voice `v` starts on channel `v % in_channels`. Stereo, as on norns, is two voices on two buffers, panned apart.
 
 - `buffer`: norns buffer operations on plain slices: `write` (a file read, once decoded), `clear` and `copy`/`copy_within`, each a blended write with edge fades. `EngineCmd::ClearRegion` and `CopyRegion` run them on the audio thread. A reversed copy between partly overlapping regions of one buffer needs a temporary copy, so it is refused rather than allocating.
 
@@ -75,6 +76,10 @@ The ring has one producer. Hosts with several control sources must serialize the
 
 To read settings back on the control thread, keep a shadow `Voice` there: apply each `VoiceCmd` to it before sending, and read its getters. The `rt` module docs show the pattern and its limits.
 
+## Effects
+
+`softcut-fx` is a `Chain` of five effects in fixed order: saturation (softcut's soft-clip curve with drive), bitcrusher (bit depth and sample-rate reduction), chorus, delay (with damping in the feedback loop; time changes glide) and reverb (Freeverb). Each switches on and off; a disabled effect passes audio unchanged and costs nothing. A chain is mono or stereo, allocates only when created, and takes settings as `FxCmd`, a `Copy` enum, so it runs on the audio thread. Feedback paths flush values below 1e-20 to zero to avoid denormal slowdowns.
+
 ## OSC
 
 `softcut-osc` speaks the protocol of softcut-lib's reference client, `softcut_jack_osc`: the messages norns sends to its audio engine, with 0-based voice and buffer indices. Every `/set/param/cut/*` setting, the mix and routing messages (`/set/level/cut`, `/set/pan/cut`, `/set/level/in_cut`, `/set/level/cut_cut`), the `/softcut/buffer/*` read, write and clear messages, `/softcut/reset` and the phase poll are supported.
@@ -118,6 +123,8 @@ make demo
 Four voices run over a stereo pair of 43.7 s buffers (at 48 kHz), L and R, as two linked stereo pairs: voices 1+2 and 3+4. Editing one voice of a linked pair applies to both, on opposite buffers with mirrored pan; untick "link" to control them separately. Each voice records the input channel matching its buffer. Voices 1+2 record when you press rec; voices 3+4 play back at half speed, reversed, through a lowpass. The input row picks any recording device (a mic, an interface, a virtual device such as BlackHole) and, on devices with more than two inputs, which channel pair feeds L and R. A mono device feeds both. On macOS 14.6+ and Windows it also lists output devices as "system audio" sources, which capture everything playing on that device, softcut included, so recording one while softcut plays feeds back. The input is off at startup, and its stream stays paused while off. If an input delivers nothing, or only exact silence, for 2 s, the status line says so; on macOS exact silence usually means the terminal lacks the Microphone or System Audio Recording permission. System-audio capture is verified on macOS 26.7 with that permission granted, and delivers exact silence without it. The same row picks the output device. The engine uses `Quirks::Fixed`, so recordings keep the input's polarity. "crossfade curves" sets each voice's fade shapes and ratios.
 
 "load wav..." or dropping a file on the window loads a WAV into both buffers: stereo files split L/R, mono files fill both. Files at another rate are resampled to the device rate with a Kaiser-windowed sinc (cutoff at 95% of the lower Nyquist, about 80 dB stopband), then truncated to fit. Loading stops recording and loops every voice over the file. "save loop..." writes the selected voice's loop region as a 32-bit float WAV: stereo from both buffers for a linked pair, mono from the voice's buffer otherwise. It saves buffer contents, without the voice's rate, level or filter; "record output..." captures those. "clear loop" silences the selected voice's loop region; "reverse loop" reverses it in place.
+
+Effects: each voice has a mono insert chain ("effects" in the voice panel, shared by a linked pair), and the mix has a stereo chain ("master effects" under the waveform). With all 25 effects on, rendering runs at about 70 times realtime on an M-series Mac.
 
 "record output..." records what you hear, the mix of all voices, to a stereo 32-bit float WAV at the engine's rate, until "stop recording". The audio thread only copies each block into a 2 s queue; a writer thread writes the file. If the writer falls behind, blocks are dropped and counted rather than stalling the audio. Quitting mid-recording still finalizes the file.
 

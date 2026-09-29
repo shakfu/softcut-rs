@@ -20,6 +20,8 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use softcut::rt::{self, Handle, Processor};
 use softcut::{Engine, EngineConfig, Quirks};
 
+use softcut_fx::{Chain, FxCmd};
+
 use crate::recorder::Recorder;
 use crate::resample::{DriftServo, Streamer};
 
@@ -61,6 +63,13 @@ impl Source {
             Source::Off
         }
     }
+}
+
+/// Which effects chain a command is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FxTarget {
+    Voice(usize),
+    Master,
 }
 
 /// A device the demo can record from.
@@ -230,6 +239,7 @@ pub struct Audio {
     /// The recording ring's reader, held here between recordings.
     rec_rx: Option<Consumer<f32>>,
     recorder: Option<Recorder>,
+    fx_tx: Producer<(FxTarget, FxCmd)>,
 }
 
 impl Audio {
@@ -303,6 +313,12 @@ impl Audio {
                 Err(e)
             }
         }
+    }
+
+    /// Queue an effects setting; applied before the next block. A full queue
+    /// drops it, as the engine's own command queue does.
+    pub fn send_fx(&mut self, target: FxTarget, cmd: FxCmd) {
+        let _ = self.fx_tx.push((target, cmd));
     }
 
     /// Record the output mix to a stereo 32-bit float WAV at `path`.
@@ -433,6 +449,7 @@ pub fn start(setup: impl FnOnce(&mut Engine)) -> Result<Audio, String> {
 
     let (input_tx, input_rx) = RingBuffer::<f32>::new(MAX_FRAMES * 4);
     let (rec_tx, rec_rx) = RingBuffer::<f32>::new(sample_rate as usize * 2 * RECORD_SECONDS);
+    let (fx_tx, fx_rx) = RingBuffer::new(1024);
     let meters = Arc::new(Meters {
         source: AtomicU8::new(Source::Off as u8),
         peaks: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
@@ -447,7 +464,9 @@ pub fn start(setup: impl FnOnce(&mut Engine)) -> Result<Audio, String> {
         processor,
         input_rx,
         rec_tx,
+        fx_rx,
         meters.clone(),
+        sample_rate as f32,
     )));
     let (stream, out_rate) = open_output(out_dev, sample_rate, state.clone())?;
     state
@@ -475,6 +494,7 @@ pub fn start(setup: impl FnOnce(&mut Engine)) -> Result<Audio, String> {
         },
         rec_rx: Some(rec_rx),
         recorder: None,
+        fx_tx,
     };
     audio.input_error = match audio.inputs.first() {
         Some(d) if !d.loopback => audio.select_input(0, 0).err(),
@@ -629,6 +649,10 @@ struct AudioState {
     input: Consumer<f32>,
     /// Output mix frames for the recorder, while `Meters::recording` is set.
     rec_tx: Producer<f32>,
+    fx_rx: Consumer<(FxTarget, FxCmd)>,
+    /// A mono insert chain per voice, and a stereo chain on the mix.
+    voice_fx: Vec<Chain>,
+    master_fx: Chain,
     /// False until `INPUT_FILL` frames have queued, at startup and after an underrun.
     primed: bool,
     meters: Arc<Meters>,
@@ -649,12 +673,17 @@ impl AudioState {
         processor: Processor,
         input: Consumer<f32>,
         rec_tx: Producer<f32>,
+        fx_rx: Consumer<(FxTarget, FxCmd)>,
         meters: Arc<Meters>,
+        sample_rate: f32,
     ) -> Self {
         Self {
             processor,
             input,
             rec_tx,
+            fx_rx,
+            voice_fx: (0..VOICES).map(|_| Chain::new(sample_rate, 1)).collect(),
+            master_fx: Chain::new(sample_rate, 2),
             primed: false,
             meters,
             stereo_in: vec![0.0; MAX_FRAMES * 2],
@@ -676,6 +705,13 @@ impl AudioState {
     }
 
     fn render(&mut self, data: &mut [f32], channels: usize) {
+        while let Ok((target, cmd)) = self.fx_rx.pop() {
+            match target {
+                FxTarget::Voice(v) if v < VOICES => self.voice_fx[v].apply(cmd),
+                FxTarget::Voice(_) => {}
+                FxTarget::Master => self.master_fx.apply(cmd),
+            }
+        }
         if self.out_resampler.is_some() {
             self.render_resampled(data, channels);
         } else {
@@ -686,7 +722,10 @@ impl AudioState {
                     &self.stereo_in[..frames * 2],
                     &mut self.stereo_out[..frames * 2],
                 );
-                self.processor.process(inp, out);
+                let voice_fx = &mut self.voice_fx;
+                self.processor
+                    .process_with(inp, out, |v, block| voice_fx[v].process(block));
+                self.master_fx.process(out);
                 record(&self.meters, &mut self.rec_tx, out);
                 for (dst, src) in chunk.chunks_exact_mut(channels).zip(out.as_chunks::<2>().0) {
                     write_frame(dst, *src);
@@ -709,7 +748,10 @@ impl AudioState {
                     &self.stereo_in[..BLOCK * 2],
                     &mut self.stereo_out[..BLOCK * 2],
                 );
-                self.processor.process(inp, out);
+                let voice_fx = &mut self.voice_fx;
+                self.processor
+                    .process_with(inp, out, |v, block| voice_fx[v].process(block));
+                self.master_fx.process(out);
                 record(&self.meters, &mut self.rec_tx, out);
                 let (Some(rs), pending) = (self.out_resampler.as_mut(), &mut self.pending) else {
                     unreachable!("render_resampled without a resampler")
@@ -792,15 +834,57 @@ mod tests {
     use super::*;
     use softcut::{EngineCmd, VoiceCmd};
 
+    /// Effect commands reach the chains: a 1-bit crusher rounds a quiet
+    /// voice to silence, on its own insert or on the master.
+    #[test]
+    fn effects_apply_to_voice_inserts_and_master() {
+        use softcut_fx::Fx;
+        let render_peak = |target: Option<FxTarget>| {
+            let mut e = engine(44100.0);
+            e.buffer_mut(0).fill(0.2);
+            for c in [
+                VoiceCmd::LoopEnd(1.0),
+                VoiceCmd::Loop(true),
+                VoiceCmd::Play(true),
+            ] {
+                e.apply(EngineCmd::Voice(0, c));
+            }
+            let (mut st, _tx, _rec, mut fx) = state_all(e);
+            if let Some(t) = target {
+                fx.push((t, FxCmd::Enable(Fx::Bitcrusher, true))).unwrap();
+                fx.push((t, FxCmd::Bits(1.0))).unwrap();
+            }
+            let mut data = vec![0.0; 512 * 2];
+            (0..4).fold(0.0f32, |m, _| {
+                st.render(&mut data, 2);
+                data.iter().fold(m, |m, x| m.max(x.abs()))
+            })
+        };
+        assert!(render_peak(None) > 0.1);
+        assert_eq!(render_peak(Some(FxTarget::Master)), 0.0);
+        assert_eq!(render_peak(Some(FxTarget::Voice(0))), 0.0);
+        // A chain on another voice leaves voice 0 alone.
+        assert!(render_peak(Some(FxTarget::Voice(1))) > 0.1);
+    }
+
     fn state(engine: Engine) -> (AudioState, Producer<f32>) {
-        let (st, tx, _rec) = state_rec(engine);
+        let (st, tx, ..) = state_all(engine);
         (st, tx)
     }
 
-    /// The state, the input ring's writer and the recording ring's reader.
     fn state_rec(engine: Engine) -> (AudioState, Producer<f32>, Consumer<f32>) {
+        let (st, tx, rec, _) = state_all(engine);
+        (st, tx, rec)
+    }
+
+    type FxSender = Producer<(FxTarget, FxCmd)>;
+
+    /// The state, the input ring's writer, the recording ring's reader and
+    /// the effects queue's writer.
+    fn state_all(engine: Engine) -> (AudioState, Producer<f32>, Consumer<f32>, FxSender) {
         let (tx, rx) = RingBuffer::new(MAX_FRAMES * 4);
         let (rec_tx, rec_rx) = RingBuffer::new(1 << 16);
+        let (fx_tx, fx_rx) = RingBuffer::new(16);
         let meters = Arc::new(Meters {
             source: AtomicU8::new(Source::On as u8),
             peaks: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
@@ -812,7 +896,12 @@ mod tests {
             view_frames: AtomicUsize::new(BUFFER_FRAMES),
         });
         let (_handle, processor) = rt::split(engine, 16);
-        (AudioState::new(processor, rx, rec_tx, meters), tx, rec_rx)
+        (
+            AudioState::new(processor, rx, rec_tx, fx_rx, meters, 44100.0),
+            tx,
+            rec_rx,
+            fx_tx,
+        )
     }
 
     /// While recording, both render paths copy exactly the engine frames they

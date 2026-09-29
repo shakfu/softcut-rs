@@ -3109,8 +3109,13 @@ dependencies = [
  "rfd",
  "rtrb",
  "softcut",
+ "softcut-fx",
  "softcut-osc",
 ]
+
+[[package]]
+name = "softcut-fx"
+version = "0.1.0"
 
 [[package]]
 name = "softcut-osc"

@@ -8,12 +8,14 @@
 
 ## Medium
 
-- [ ] Investigate an effects chain in the demo, per voice or on the mix of all voices. Two sources: CLAP plugins hosted with [clack](https://github.com/prokopyl/clack) (`clack-host` 0.2 on crates.io; CLAP only, no VST3 or AU), or built-in DSP effects. Questions to settle:
-  - Where it inserts. A chain on the mix can run after `Engine::process` in the demo. A chain per voice needs a hook in `Engine` between each voice's output and the mix, which the library does not expose yet.
-  - Realtime safety. A plugin's `process` runs on the audio thread, but CLAP also calls back on a main thread (parameters, state, GUI). Loading, activating and removing plugins must happen off the audio thread, with a handover like the buffer swap in `rt`.
-  - Built-in effects needing no dependency: delay, reverb, saturation. softcut already has a state-variable filter and a soft clipper.
-  - Sample rate and latency: plugins activate at the engine's rate, and a chain adds its latency to output recording.
+- [ ] softcut as a CLAP/VST3 plugin, built with [nice-plug](https://codeberg.org/RustAudio/nice-plug) (`nice-plug` 0.4, ISC; VST3 bindings MIT/Apache-2.0; `nice-plug-egui` uses egui 0.36, as the demo does; experimental per its README). A `softcut-plugin` crate would drive `Voice`/`Engine` from the host's process callback; `rt` is not needed, since the framework handles threading and parameter smoothing. Questions to settle:
+  - Parameters. A plugin exposes a fixed list; softcut has 4-6 voices with about 30 settings each. Decide which are automatable and which stay in the GUI only.
+  - Session state. Two 43.7 s buffers (2^21 frames each, as in the demo) are ~17 MB of f32 to store with the host's session; the library's default of 2^24 frames is 8 times that. Options: store them compressed (nice-plug has a `zstd` feature), store only the used loop regions, or reference files on disk.
+  - GUI. Reuse the demo's egui waveform lanes and voice controls through `nice-plug-egui`.
+  - Input routing. A host's stereo input maps onto the engine's two input channels; sidechain input is optional.
 
 ## Low
+
+- [ ] Demo: host CLAP plugins in the effects chains with [clack](https://github.com/prokopyl/clack) (`clack-host` 0.2; CLAP only). Built-in effects exist (`softcut-fx`). A plugin's `process` runs on the audio thread, but CLAP also calls back on a main thread (parameters, state, GUI); loading and removing plugins needs a handover off the audio thread, like the buffer swap in `rt`. (nice-plug was ruled out: it builds plugins but does not host them.)
 
 - [ ] Publish voice settings through `rt`, only if a host with several control sources needs them. Until then a shadow `Voice` on the control thread covers it (documented in `rt`).

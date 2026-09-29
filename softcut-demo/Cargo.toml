@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 softcut = { path = "../softcut", features = ["rtrb"] }
+softcut-fx = { path = "../softcut-fx" }
 softcut-osc = { path = "../softcut-osc" }
 cpal = "0.18"
 eframe = "0.36"
