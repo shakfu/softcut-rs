@@ -59,6 +59,32 @@ pub enum Quirks {
     Fixed,
 }
 
+/// One of a voice's two crossfading heads, from [`Voice::heads`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HeadState {
+    /// Seconds.
+    pub position: f32,
+    /// Crossfade progress: 0 silent, 1 fully in.
+    pub fade: f32,
+    /// Output gain, the equal-power `sin(fade * pi / 2)` the mix applies.
+    pub gain: f32,
+    /// The head that is playing through or fading in; the other is fading
+    /// out or stopped.
+    pub active: bool,
+}
+
+impl HeadState {
+    /// From a position in seconds, a fade progress and the active flag.
+    pub fn new(position: f32, fade: f32, active: bool) -> Self {
+        Self {
+            position,
+            fade,
+            gain: (fade * std::f32::consts::FRAC_PI_2).sin(),
+            active,
+        }
+    }
+}
+
 /// A crossfading, resampling read/write head over a caller-owned buffer, with
 /// pre (input) and post (output) state-variable filters.
 ///
@@ -571,6 +597,27 @@ impl Voice {
         self.rec
     }
 
+    /// Both heads. During a crossfade one fades out while the other fades in;
+    /// otherwise one plays and the other is stopped at gain 0.
+    pub fn heads(&self) -> [HeadState; 2] {
+        let sr = self.sample_rate as f64;
+        self.head
+            .subheads()
+            .map(|(phase, fade, active)| HeadState::new((phase / sr) as f32, fade, active))
+    }
+
+    /// The rec fade curve at crossfade progress `x` in [0, 1]: new input is
+    /// written at `rec_level` times this.
+    pub fn rec_fade_value(&self, x: f32) -> f32 {
+        self.head.curves().rec_value(x.clamp(0.0, 1.0))
+    }
+
+    /// The pre fade curve at crossfade progress `x` in [0, 1]: existing
+    /// content is kept at `pre_level + (1 - pre_level) * this`.
+    pub fn pre_fade_value(&self, x: f32) -> f32 {
+        self.head.curves().pre_value(x.clamp(0.0, 1.0))
+    }
+
     /// Current position of the active subhead.
     pub fn position(&self) -> f32 {
         (self.head.active_phase() / self.sample_rate as f64) as f32
@@ -841,6 +888,41 @@ mod tests {
         // end (upstream), so a steeper curve ends at 0.99988, not 1.
         assert!(diff(0..2400) > 0.05, "{}", diff(0..2400));
         assert!(diff(3000..5900) < 1e-3, "{}", diff(3000..5900));
+    }
+
+    #[test]
+    fn heads_show_a_crossfade_in_progress() {
+        let mut v = Voice::with_quirks(1000.0, Quirks::Fixed);
+        let mut buf = vec![0.0; 1 << 12];
+        v.set_fade_time(0.1);
+        v.set_loop_end(1.0);
+        v.set_loop(true);
+        v.set_play(true);
+        let mut out = [0.0; 500];
+        v.process_block(&mut buf, &[0.0; 500], &mut out);
+        let [a, b] = v.heads();
+        assert!(a.active && a.gain == 1.0 && b.gain == 0.0, "{a:?} {b:?}");
+        v.cut_to(0.2);
+        // Halfway through the 100-frame crossfade.
+        v.process_block(&mut buf, &[0.0; 50], &mut out[..50]);
+        let [a, b] = v.heads();
+        assert!(!a.active && b.active, "{a:?} {b:?}");
+        assert!(
+            (a.fade - 0.5).abs() < 0.02 && (b.fade - 0.5).abs() < 0.02,
+            "{a:?} {b:?}"
+        );
+        assert!((b.position - 0.25).abs() < 1e-3 && (a.position - 0.55).abs() < 1e-3);
+        assert!((a.gain - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.02);
+    }
+
+    #[test]
+    fn fade_curve_values_follow_the_settings() {
+        let mut v = Voice::with_quirks(48000.0, Quirks::Fixed);
+        assert_eq!((v.pre_fade_value(0.0), v.pre_fade_value(1.0)), (1.0, 0.0));
+        assert_eq!(v.rec_fade_value(0.0), 0.0);
+        v.set_rec_delay_ratio(0.5);
+        assert_eq!(v.rec_fade_value(0.45), 0.0);
+        assert!(v.rec_fade_value(0.9) > 0.5);
     }
 
     #[test]

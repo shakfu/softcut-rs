@@ -400,6 +400,11 @@ impl ReadWriteHead {
         self.head[self.active].phase
     }
 
+    /// Each subhead's phase in frames, fade progress, and whether it is active.
+    pub(crate) fn subheads(&self) -> [(f64, f32, bool); 2] {
+        [0, 1].map(|i| (self.head[i].phase, self.head[i].fade, i == self.active))
+    }
+
     /// Cut with crossfade; queued if a crossfade is already running.
     pub(crate) fn cut_to_pos(&mut self, seconds: f32) {
         let pos = (seconds * self.sr) as f64;

@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::{Engine, EngineCmd, buffer};
+use crate::{Engine, EngineCmd, HeadState, buffer};
 
 enum Msg {
     Cmd(EngineCmd),
@@ -110,6 +110,8 @@ struct Shared {
     position: Box<[AtomicU32]>,
     rec: Box<[AtomicBool]>,
     play: Box<[AtomicBool]>,
+    /// Per voice and head: position and fade as f32 bits, and the active flag.
+    heads: Box<[[(AtomicU32, AtomicU32, AtomicBool); 2]]>,
 }
 
 /// Returns the control half and the audio half of `engine`. `capacity` is the
@@ -122,6 +124,13 @@ pub fn split(engine: Engine, capacity: usize) -> (Handle, Processor) {
         position: (0..n).map(|_| AtomicU32::new(0)).collect(),
         rec: (0..n).map(|_| AtomicBool::new(false)).collect(),
         play: (0..n).map(|_| AtomicBool::new(false)).collect(),
+        heads: (0..n)
+            .map(|_| {
+                std::array::from_fn(|_| {
+                    (AtomicU32::new(0), AtomicU32::new(0), AtomicBool::new(false))
+                })
+            })
+            .collect(),
     });
     let (tx, rx) = RingBuffer::new(capacity);
     let (spent_tx, spent_rx) = RingBuffer::new(capacity);
@@ -295,6 +304,20 @@ impl Handle {
     pub fn play(&self, voice: usize) -> bool {
         self.shared.play[voice].load(Relaxed)
     }
+
+    /// Both heads of `voice`, as of the last `process` call; see
+    /// [`Voice::heads`](crate::Voice::heads).
+    pub fn heads(&self, voice: usize) -> [HeadState; 2] {
+        self.shared.heads[voice]
+            .each_ref()
+            .map(|(pos, fade, active)| {
+                HeadState::new(
+                    f32::from_bits(pos.load(Relaxed)),
+                    f32::from_bits(fade.load(Relaxed)),
+                    active.load(Relaxed),
+                )
+            })
+    }
 }
 
 /// Audio-thread half: owns the engine. Allocation-, deallocation- and lock-free.
@@ -375,6 +398,11 @@ impl Processor {
             self.shared.position[i].store(v.position().to_bits(), Relaxed);
             self.shared.rec[i].store(v.rec(), Relaxed);
             self.shared.play[i].store(v.play(), Relaxed);
+            for (slot, h) in self.shared.heads[i].iter().zip(v.heads()) {
+                slot.0.store(h.position.to_bits(), Relaxed);
+                slot.1.store(h.fade.to_bits(), Relaxed);
+                slot.2.store(h.active, Relaxed);
+            }
         }
     }
 }
@@ -404,6 +432,9 @@ mod tests {
         let mut out = [0.0; 480 * 2];
         p.process(&[0.0; 480], &mut out);
         assert!(h.play(1) && !h.play(0));
+        let [a, b] = h.heads(1);
+        assert!(a.active && a.gain == 1.0 && b.gain == 0.0, "{a:?} {b:?}");
+        assert_eq!(a.position, h.position(1));
         assert!((h.position(1) - 0.01).abs() < 1e-4, "{}", h.position(1));
     }
 

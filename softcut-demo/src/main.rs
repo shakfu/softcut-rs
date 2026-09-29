@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use audio::{Audio, BUFFER_FRAMES, BUFFERS, InputDevice, Source, VOICES, WAVE_BINS};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use softcut::rt::Returned;
-use softcut::{Engine, EngineCmd, FadeShape, VoiceCmd};
+use softcut::{Engine, EngineCmd, FadeShape, Quirks, Voice, VoiceCmd};
 use softcut_osc::{Action, PhasePoll};
 
 const COLORS: [Color32; VOICES] = [
@@ -309,6 +309,128 @@ fn randomize_voices(
     }
 }
 
+/// Where a voice's loop crossfades happen, in buffer seconds: the incoming
+/// head fades in from its entry point, the outgoing one fades out past its
+/// exit. A crossfade spans `fade_time` of buffer whatever the rate, since
+/// the fade advances with the head.
+struct FadeZone {
+    /// Where the fade starts.
+    origin: f32,
+    /// Direction of travel through the buffer: 1 forward, -1 reverse.
+    dir: f32,
+    fading_in: bool,
+}
+
+impl VoiceUi {
+    fn fade_zones(&self) -> Vec<FadeZone> {
+        if self.fade_time <= 0.0 {
+            return Vec::new();
+        }
+        // softcut treats rate 0 as reverse.
+        let (entry, exit, dir) = match self.rate > 0.0 {
+            true => (self.loop_start, self.loop_end, 1.0),
+            false => (self.loop_end, self.loop_start, -1.0),
+        };
+        let mut zones = vec![FadeZone {
+            origin: exit,
+            dir,
+            fading_in: false,
+        }];
+        if self.loop_on {
+            zones.push(FadeZone {
+                origin: entry,
+                dir,
+                fading_in: true,
+            });
+        }
+        zones
+    }
+}
+
+impl FadeZone {
+    /// Points (buffer seconds, output gain) along the fade.
+    fn curve(&self, fade_time: f32) -> impl Iterator<Item = (f32, f32)> + '_ {
+        const N: usize = 32;
+        (0..=N).map(move |k| {
+            let progress = k as f32 / N as f32;
+            let fade = if self.fading_in {
+                progress
+            } else {
+                1.0 - progress
+            };
+            let t = self.origin + self.dir * progress * fade_time;
+            (t, (fade * std::f32::consts::FRAC_PI_2).sin())
+        })
+    }
+}
+
+/// The voice's rec and pre curves and the heads' output gain against
+/// crossfade progress, read from a shadow `Voice` with the same settings.
+fn fade_curve_plot(ui: &mut egui::Ui, v: &VoiceUi, sample_rate: f32, color: Color32) {
+    let mut shadow = Voice::with_quirks(sample_rate, Quirks::Fixed);
+    shadow.set_rec_fade_shape(v.rec_fade_shape);
+    shadow.set_pre_fade_shape(v.pre_fade_shape);
+    shadow.set_rec_delay_ratio(v.rec_delay_ratio);
+    shadow.set_pre_window_ratio(v.pre_window_ratio);
+
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 90.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    let plot = rect.shrink(6.0);
+    let at = |x: f32, y: f32| {
+        Pos2::new(
+            plot.left() + x * plot.width(),
+            plot.bottom() - y * plot.height(),
+        )
+    };
+    let curve = |f: &dyn Fn(f32) -> f32| -> Vec<Pos2> {
+        (0..=100)
+            .map(|k| k as f32 / 100.0)
+            .map(|x| at(x, f(x)))
+            .collect()
+    };
+    let dim = ui.visuals().weak_text_color();
+    let gain = |x: f32| (x * std::f32::consts::FRAC_PI_2).sin();
+    painter.add(egui::Shape::line(curve(&gain), Stroke::new(1.0, dim)));
+    painter.add(egui::Shape::line(
+        curve(&|x| shadow.pre_fade_value(x)),
+        Stroke::new(1.5, ui.visuals().text_color()),
+    ));
+    painter.add(egui::Shape::line(
+        curve(&|x| shadow.rec_fade_value(x)),
+        Stroke::new(2.0, color),
+    ));
+    let font = egui::FontId::monospace(10.0);
+    painter.text(
+        plot.left_top(),
+        egui::Align2::LEFT_TOP,
+        "rec",
+        font.clone(),
+        color,
+    );
+    painter.text(
+        plot.left_top() + Vec2::new(28.0, 0.0),
+        egui::Align2::LEFT_TOP,
+        "pre",
+        font.clone(),
+        ui.visuals().text_color(),
+    );
+    painter.text(
+        plot.left_top() + Vec2::new(56.0, 0.0),
+        egui::Align2::LEFT_TOP,
+        "gain",
+        font.clone(),
+        dim,
+    );
+    painter.text(
+        plot.right_bottom(),
+        egui::Align2::RIGHT_BOTTOM,
+        "fade 0 -> 1",
+        font,
+        dim,
+    );
+}
+
 /// A save waiting for both buffers' snapshots to come back.
 struct PendingSave {
     path: PathBuf,
@@ -535,6 +657,23 @@ impl App {
                     Rect::from_x_y_ranges(x_of(v.loop_start)..=x_of(v.loop_end), lane.y_range());
                 let alpha = if i == self.selected { 60 } else { 22 };
                 painter.rect_filled(band, 0.0, COLORS[i].gamma_multiply_u8(alpha));
+                // Output gain across each crossfade, from 0 at the lane's
+                // bottom to 1 near its top.
+                let (width, alpha) = if i == self.selected {
+                    (2.0, 255)
+                } else {
+                    (1.0, 110)
+                };
+                for zone in v.fade_zones() {
+                    let points = zone
+                        .curve(v.fade_time)
+                        .map(|(t, g)| Pos2::new(x_of(t), lane.bottom() - g * lane_h * 0.9))
+                        .collect();
+                    painter.add(egui::Shape::line(
+                        points,
+                        Stroke::new(width, COLORS[i].gamma_multiply_u8(alpha)),
+                    ));
+                }
             }
             let mid = lane.center().y;
             for bin in 0..WAVE_BINS {
@@ -550,12 +689,16 @@ impl App {
                 if v.buffer != b || (!v.play && !v.rec) {
                     continue;
                 }
-                let t = self.audio.handle.position(i);
-                if !(0.0..=len).contains(&t) {
-                    continue;
-                }
+                // Both heads, each as bright as its gain: during a crossfade
+                // one fades out as the other fades in.
                 let width = if v.rec { 3.0 } else { 1.5 };
-                painter.vline(x_of(t), lane.y_range(), Stroke::new(width, COLORS[i]));
+                for h in self.audio.handle.heads(i) {
+                    if h.gain < 0.01 || !(0.0..=len).contains(&h.position) {
+                        continue;
+                    }
+                    let color = COLORS[i].gamma_multiply(h.gain);
+                    painter.vline(x_of(h.position), lane.y_range(), Stroke::new(width, color));
+                }
             }
             painter.text(
                 lane.left_top() + Vec2::new(4.0, 2.0),
@@ -621,6 +764,7 @@ impl App {
         if self.linked[pair] && !was_linked {
             self.voices[i ^ 1] = self.voices[i].partner();
         }
+        let sr = self.audio.sample_rate;
         let v = &mut self.voices[i];
         ui.horizontal(|ui| {
             ui.toggle_value(&mut v.play, "play");
@@ -738,6 +882,7 @@ impl App {
                     .on_hover_text("fraction of the crossfade before new input fades in");
                 ui.add(egui::Slider::new(&mut v.pre_window_ratio, 0.0..=1.0).text("pre window"))
                     .on_hover_text("fraction of the crossfade over which existing content is kept");
+                fade_curve_plot(ui, v, sr, COLORS[i]);
             });
 
         for t in self.targets(i) {
@@ -1509,5 +1654,48 @@ mod tests {
         assert_ne!(voices[3], voices[2].partner());
         randomize_voices(&mut voices, &[true, true], Some(3), &mut rng, ALL, 3.0);
         assert_eq!(voices[2], voices[3].partner());
+    }
+
+    #[test]
+    fn fade_zones_follow_direction_and_loop_flag() {
+        let v = VoiceUi {
+            loop_start: 1.0,
+            loop_end: 3.0,
+            fade_time: 0.2,
+            rate: 1.5,
+            ..VoiceUi::preset(0)
+        };
+        let ends = |z: &FadeZone| {
+            let pts: Vec<_> = z.curve(v.fade_time).collect();
+            (pts[0], *pts.last().unwrap())
+        };
+        let zones = v.fade_zones();
+        // Forward: fade out past the end, fade in from the start.
+        assert_eq!((zones[0].origin, zones[0].fading_in), (3.0, false));
+        assert_eq!(ends(&zones[0]), ((3.0, 1.0), (3.2, 0.0)));
+        assert_eq!((zones[1].origin, zones[1].fading_in), (1.0, true));
+        assert_eq!(ends(&zones[1]), ((1.0, 0.0), (1.2, 1.0)));
+        // Reverse: mirrored, past the start and in from the end.
+        let rev = VoiceUi { rate: -0.5, ..v }.fade_zones();
+        assert_eq!((rev[0].origin, rev[0].dir), (1.0, -1.0));
+        assert_eq!(ends(&rev[1]), ((3.0, 0.0), (2.8, 1.0)));
+        // One-shot: only the fade-out; no fade, no zones.
+        assert_eq!(
+            VoiceUi {
+                loop_on: false,
+                ..v
+            }
+            .fade_zones()
+            .len(),
+            1
+        );
+        assert!(
+            VoiceUi {
+                fade_time: 0.0,
+                ..v
+            }
+            .fade_zones()
+            .is_empty()
+        );
     }
 }
