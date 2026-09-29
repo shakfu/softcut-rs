@@ -3,9 +3,14 @@ resolver = "3"
 members = ["softcut", "softcut-demo", "softcut-fx", "softcut-osc"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/shakfu/softcut-rs"
+rust-version = "1.89"
 
-[profile.dev.package.softcut]
+[workspace.dependencies]
+softcut = { package = "softcut-rs", path = "softcut", version = "0.1.0" }
+
+[profile.dev.package.softcut-rs]
 opt-level = 2

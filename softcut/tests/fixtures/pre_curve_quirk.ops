@@ -1,0 +1,15 @@
+fill 0.5
+set loop_start 0
+set loop_end 1
+set loop 1
+set rec_level 1
+set pre_level 0
+set fade_time 0.02
+set rec_fade_shape linear
+set pre_fade_shape raised
+set rec 1
+set play 1
+cut 0.1
+process 9600
+cut 0.5
+process 9600

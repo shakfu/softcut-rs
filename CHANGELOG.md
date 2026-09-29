@@ -4,7 +4,11 @@ All notable changes to this project. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-29
+
 First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-lib), OSC control over its reference protocol, and an egui demo.
+
+The core crate is published as `softcut-rs` and imported as `softcut`. The `softcut` crate name is left for an official monome crate.
 
 ### Added
 
@@ -19,7 +23,7 @@ First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-li
 - `Voice::heads` (both crossfading heads' position, fade and gain) and `rec_fade_value`/`pre_fade_value`, for visualizing crossfades; `rt::Handle::heads` publishes the heads.
 - `buffer`: norns buffer operations (write, clear, copy) on slices, and `EngineCmd::ClearRegion` and `CopyRegion` to run them on the audio thread. Copies within one buffer need no temporary; a reversed copy between partly overlapping regions is refused rather than allocating.
 - `rt` (feature `rtrb`): a `Handle` for the control thread and a `Processor` for the audio thread. Commands, buffer loads, writes and snapshots share one ring, so they apply in the order sent. Every buffer sent comes back to the control thread, so the audio thread never frees memory.
-- Golden tests against softcut-lib, run through softcut-py, under both `Quirks` modes. They check the `rec`, `rec_once` and `fade_time` that softcut-lib changes itself, as well as audio and position. The README's "Parity with the C++ engine" section gives tolerances and deviations. A separate test checks that faded loop wraps, in playback and overdub, add no click.
+- Golden tests against softcut-lib, run through softcut-py, under both `Quirks` modes. They check the `rec`, `rec_once` and `fade_time` that softcut-lib changes itself, both crossfading heads, audio and position. A scenario covers the pre-curve quirk. The README's "Parity with the C++ engine" section gives tolerances and deviations. A separate test checks that faded loop wraps, in playback and overdub, add no click.
 
 #### softcut-fx
 
@@ -32,6 +36,7 @@ First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-li
 - `Server`: receives UDP on its own thread and forwards actions over a bounded channel, so the host applies them through its one control path, such as an `rt::Handle`. It listens on loopback by default, because the protocol writes files at paths the sender names. A full channel drops actions and counts them.
 - `PhasePoll`: reports each voice's quantized position as `/poll/softcut/phase i f` when it changes.
 - Arguments are type-checked, ints and floats coerced as the reference's liblo does, and non-finite numbers rejected before they reach the engine.
+- `rosc` is re-exported, because `parse` and `Server::send` take its `OscMessage`.
 - `level_slew_time`, `pan_slew_time`, `/set/enabled/cut`, the VU poll and `/quit` are accepted and ignored: the engine has no counterpart, and a network message does not quit the host.
 
 #### softcut-demo
@@ -46,4 +51,5 @@ First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-li
 - Randomization of rate, loop region, pan and level, and filter, per voice or for all voices, once or on a timer. Rates are drawn from octaves and fifths so results stay in tune.
 - Input and output device selection. Devices at other rates, input or output, are resampled live, and resampled input is steered against clock drift rather than dropping or padding frames. Output devices appear as system-audio sources on macOS 14.6+ and Windows. The status line reports an input that is exactly silent, which on macOS usually means a missing permission.
 
-[Unreleased]: https://github.com/shakfu/softcut-rs/commits/main
+[Unreleased]: https://github.com/shakfu/softcut-rs/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/shakfu/softcut-rs/releases/tag/v0.1.0

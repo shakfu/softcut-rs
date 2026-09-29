@@ -1,5 +1,5 @@
-# Mirrors `make test` and `make lint`. Commands are spelled out because the
-# Windows runner has no make.
+# Mirrors `make test`, `make lint` and `make publish-dry`. Commands are spelled
+# out because the Windows runner has no make.
 name: CI
 
 on:
@@ -25,7 +25,7 @@ jobs:
       fail-fast: false
       matrix:
         # ubuntu and windows are x86-64, macos is arm64: the golden fixtures
-        # were recorded on arm64, so this checks parity across libms and ISAs.
+        # were recorded on x86-64 Linux, so this checks parity across libms and ISAs.
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -39,7 +39,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libasound2-dev libwayland-dev libxkbcommon-dev
       - name: Test softcut without features
-        run: cargo test -p softcut
+        run: cargo test -p softcut-rs
       - name: Test workspace with all features
         run: cargo test --workspace --all-features
 
@@ -57,9 +57,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libasound2-dev libwayland-dev libxkbcommon-dev
       - run: cargo fmt --all --check
-      - run: cargo clippy -p softcut --all-targets
+      - run: cargo clippy -p softcut-rs --all-targets
       - run: cargo clippy --workspace --all-targets --all-features
       - name: Docs build without broken links
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc -p softcut --no-deps --all-features
+        run: cargo doc -p softcut-rs --no-deps --all-features
+      - name: Crates package and build as published
+        run: cargo publish --workspace --exclude softcut-demo --dry-run

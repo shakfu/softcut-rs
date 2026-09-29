@@ -3093,13 +3093,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "softcut"
-version = "0.1.0"
-dependencies = [
- "rtrb",
-]
-
-[[package]]
 name = "softcut-demo"
 version = "0.1.0"
 dependencies = [
@@ -3108,9 +3101,9 @@ dependencies = [
  "hound",
  "rfd",
  "rtrb",
- "softcut",
  "softcut-fx",
  "softcut-osc",
+ "softcut-rs",
 ]
 
 [[package]]
@@ -3122,7 +3115,14 @@ name = "softcut-osc"
 version = "0.1.0"
 dependencies = [
  "rosc",
- "softcut",
+ "softcut-rs",
+]
+
+[[package]]
+name = "softcut-rs"
+version = "0.1.0"
+dependencies = [
+ "rtrb",
 ]
 
 [[package]]

@@ -8,12 +8,16 @@ and writes, per scenario, into softcut/tests/fixtures/:
   <name>.out.f32  output of every `process` op, concatenated
   <name>.buf.f32  final contents of buffer 0
   <name>.state    per `process` op: position saved_position quant_phase
-                  rec rec_once play fade_time
+                  rec rec_once play fade_time, then position fade active
+                  for each of the two heads
 
 Voice and engine scenarios run under quirks="upstream" into fixtures/, and under
 quirks="fixed" into fixtures/fixed/ (out, buf and state; ops and in are shared).
 
 Pass scenario names to regenerate only those; with none, all are written.
+
+The committed fixtures come from x86-64 Linux. Regenerate them there: other
+platforms round some DSP math differently, so every file would change.
 
 Needs softcut-py (github.com/shakfu/softcut-py) built from current source.
 An installed build older than its source may not match these calls:
@@ -34,6 +38,7 @@ OUT = pathlib.Path(__file__).resolve().parent.parent / "softcut" / "tests" / "fi
 QUIRKS = {"upstream": OUT, "fixed": OUT / "fixed"}
 
 BOOLS = {"rec", "play", "loop", "rec_once"}
+SHAPES = {"rec_fade_shape", "pre_fade_shape"}
 
 
 def sine(n, hz, amp):
@@ -45,7 +50,8 @@ def noise(n, amp, seed):
     return [amp * (2 * rng.random() - 1) for _ in range(n)]
 
 
-# Voice scenarios. Ops: set <param> <value> | cut <sec> | stop | reset | process <n>
+# Voice scenarios. Ops: set <param> <value> | cut <sec> | stop | reset | fill <x>
+#   | process <n>. `fill` sets every buffer sample to x.
 VOICE_SCENARIOS = {
     "record_loop": (
         sine(40000, 220, 0.4),
@@ -186,6 +192,28 @@ VOICE_SCENARIOS = {
         process 20000
         """,
     ),
+    # Upstream applies a raised pre curve only while the rec curve is also
+    # raised, checked when the pre shape is set: rec goes linear first.
+    "pre_curve_quirk": (
+        [0.25] * 19200,
+        """
+        fill 0.5
+        set loop_start 0
+        set loop_end 1
+        set loop 1
+        set rec_level 1
+        set pre_level 0
+        set fade_time 0.02
+        set rec_fade_shape linear
+        set pre_fade_shape raised
+        set rec 1
+        set play 1
+        cut 0.1
+        process 9600
+        cut 0.5
+        process 9600
+        """,
+    ),
 }
 
 # Engine scenarios: 2 voices sharing buffer 0, block size 64, stereo out.
@@ -226,6 +254,8 @@ ENGINE_SCENARIOS = {
 
 
 def parse_value(name, v):
+    if name in SHAPES:
+        return v
     return bool(int(v)) if name in BOOLS else float(v)
 
 
@@ -263,7 +293,9 @@ def save(name, quirks, ops, inp, out, buf, states):
 def state_line(v):
     return (
         f"{v.position!r} {v.saved_position!r} {v.quant_phase!r} "
-        f"{int(v.rec)} {int(v.rec_once)} {int(v.play)} {v.fade_time!r}\n"
+        f"{int(v.rec)} {int(v.rec_once)} {int(v.play)} {v.fade_time!r} "
+        + " ".join(f"{h.position!r} {h.fade!r} {int(h.active)}" for h in v.heads)
+        + "\n"
     )
 
 
@@ -282,6 +314,9 @@ def run_voice(name, quirks, inp, ops):
             out.extend(o)
             pos += n
             states.append(state_line(v))
+        elif words[0] == "fill":
+            for i in range(FRAMES):
+                buf[i] = float(words[1])
         else:
             apply_voice_op(v, words)
     save(name, quirks, ops, inp, out, buf, states)

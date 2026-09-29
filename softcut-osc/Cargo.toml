@@ -1,11 +1,15 @@
 [package]
 name = "softcut-osc"
-version = "0.1.0"
+version.workspace = true
 description = "OSC control for the softcut crate, over softcut-lib's softcut_jack_osc protocol"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+readme = "../README.md"
+keywords = ["osc", "audio", "norns", "monome", "softcut"]
+categories = ["multimedia::audio", "network-programming"]
 
 [dependencies]
-softcut = { path = "../softcut" }
+softcut.workspace = true
 rosc = "0.11"

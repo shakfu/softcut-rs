@@ -28,6 +28,9 @@ use std::time::Duration;
 use rosc::{OscMessage, OscPacket, OscType};
 use softcut::{EngineCmd, VoiceCmd};
 
+/// `rosc` types appear in this crate's API; use this re-export to match versions.
+pub use rosc;
+
 /// The reference client's port, on loopback only.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:9999";
 /// Where the reference sends polls: sclang's default port.

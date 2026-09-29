@@ -1,10 +1,20 @@
 [package]
-name = "softcut"
-version = "0.1.0"
+name = "softcut-rs"
+version.workspace = true
 description = "Rust port of monome softcut: crossfaded, resampling record/play heads over audio buffers"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+readme = "../README.md"
+# Golden fixtures are 6 MiB; they stay in the repository.
+exclude = ["tests/fixtures/", "tests/golden.rs"]
+keywords = ["audio", "dsp", "looper", "norns", "monome"]
+categories = ["multimedia::audio"]
+
+[lib]
+# `softcut-rs` leaves the `softcut` name to an official monome crate.
+name = "softcut"
 
 [dependencies]
 rtrb = { version = "0.4", optional = true }

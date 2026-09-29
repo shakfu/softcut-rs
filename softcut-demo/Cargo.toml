@@ -1,13 +1,13 @@
 [package]
 name = "softcut-demo"
-version = "0.1.0"
+version.workspace = true
 description = "egui demo of the softcut crate: live looping with visual buffer, loops and playheads"
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
-softcut = { path = "../softcut", features = ["rtrb"] }
+softcut = { workspace = true, features = ["rtrb"] }
 softcut-fx = { path = "../softcut-fx" }
 softcut-osc = { path = "../softcut-osc" }
 cpal = "0.18"

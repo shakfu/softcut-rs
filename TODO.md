@@ -10,9 +10,9 @@
 
 - [x] `Quirks::Fixed` has unit tests but no golden fixtures. Done: every voice and engine scenario also runs under `Fixed`, against `fixtures/fixed/`. `Upstream` stays the default.
 
-- [ ] The golden fixtures, including `fixtures/fixed/`, were generated from softcut-py's uncommitted working tree (quirks switch and DSP read-backs). Once softcut-py commits that work, regenerate with `make fixtures` and confirm the files are unchanged.
+- [ ] The golden fixtures were generated on x86-64 Linux from softcut-py's uncommitted working tree on top of 97a2b47 (quirks switch, DSP read-backs, fade shapes, `Voice.heads`). Once softcut-py commits that work, regenerate with `make fixtures` on x86-64 and confirm the files are unchanged. A regeneration on 2026-09-29 reproduced `fixtures/fixed/` byte for byte; the upstream set changed only by the arm64-to-x86-64 rounding difference.
 
-- [ ] No golden scenario covers the pre-curve quirk (`calcPreFade` testing `recShape`): it applies only with a `Raised` pre shape over a non-`Raised` rec shape, and softcut-py cannot set fade shapes yet (its TODO, Medium). Add a scenario once it can.
+- [x] No golden scenario covers the pre-curve quirk (`calcPreFade` testing `recShape`). Done: `pre_curve_quirk` sets a linear rec shape, then a raised pre shape. Its buffers differ between modes by up to 0.105, and the test asserts that they differ.
 
 ## Medium
 

@@ -1,9 +1,13 @@
 [package]
 name = "softcut-fx"
-version = "0.1.0"
+version.workspace = true
 description = "Built-in effects for softcut: saturation, bitcrusher, chorus, delay and reverb, as a realtime-safe chain"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+readme = "../README.md"
+keywords = ["audio", "dsp", "effects", "reverb", "softcut"]
+categories = ["multimedia::audio"]
 
 [dependencies]

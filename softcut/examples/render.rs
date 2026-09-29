@@ -1,7 +1,7 @@
 //! Offline use of the library: record a tone into a loop, then play it back
 //! at three rates across six voices, and report the realtime factor.
 //!
-//! cargo run --release -p softcut --example render
+//! cargo run --release -p softcut-rs --example render
 
 use std::time::Instant;
 

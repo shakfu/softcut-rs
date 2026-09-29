@@ -1,22 +1,21 @@
 //! Replays scenarios recorded from the C++ softcut-lib (via softcut-py) and
-//! compares output, buffer contents, head positions and the flags softcut-lib
-//! changes itself (`rec`, `rec_once`, `fade_time`). Each voice and engine
+//! compares output, buffer contents, head positions, both crossfading heads,
+//! and the flags softcut-lib changes itself (`rec`, `rec_once`, `fade_time`). Each voice and engine
 //! scenario runs under both [`Quirks`] modes.
 //! Fixtures come from `scripts/gen_fixtures.py`.
 
 use std::fs;
 use std::path::PathBuf;
 
-use softcut::{Engine, EngineCmd, EngineConfig, Quirks, Voice, VoiceCmd, buffer};
+use softcut::{Engine, EngineCmd, EngineConfig, FadeShape, Quirks, Voice, VoiceCmd, buffer};
 
 const SR: f32 = 48000.0;
 const FRAMES: usize = 1 << 15;
-/// Measured error is <= 1.2e-7 (float rounding: clang contracts `a * b + c`
-/// into FMA on arm64, Rust does not).
+/// Fixtures are recorded on x86-64, where Rust matches them exactly. The
+/// margin covers other libms, and arm64, where clang fuses `a * b + c`.
 const TOL: f32 = 1e-6;
-/// A 1-ulp difference in the slewed rate (unfused vs fused ramp update)
-/// accumulates in the head phase during varispeed. Measured 7.6e-5; with the
-/// ramp fused, 6e-8.
+/// Against arm64 recordings, a 1-ulp difference in the slewed rate
+/// accumulates in the head phase during varispeed: measured 7.6e-5.
 const TOL_VARISPEED: f32 = 2e-4;
 
 fn fixture(name: &str, ext: &str) -> PathBuf {
@@ -54,6 +53,12 @@ fn read_state(quirks: Quirks, name: &str) -> Vec<Vec<f64>> {
 fn voice_cmd(param: &str, v: &str) -> VoiceCmd {
     let b = || v == "1";
     let x = || v.parse::<f32>().unwrap();
+    let shape = || match v {
+        "linear" => FadeShape::Linear,
+        "sine" => FadeShape::Sine,
+        "raised" => FadeShape::Raised,
+        _ => panic!("unknown fade shape {v}"),
+    };
     use VoiceCmd::*;
     match param {
         "rate" => Rate(x()),
@@ -86,6 +91,10 @@ fn voice_cmd(param: &str, v: &str) -> VoiceCmd {
         "post_filter_bp" => PostFilterBp(x()),
         "post_filter_br" => PostFilterBr(x()),
         "post_filter_dry" => PostFilterDry(x()),
+        "rec_fade_shape" => RecFadeShape(shape()),
+        "pre_fade_shape" => PreFadeShape(shape()),
+        "rec_delay_ratio" => RecDelayRatio(x()),
+        "pre_window_ratio" => PreWindowRatio(x()),
         _ => panic!("unknown param {param}"),
     }
 }
@@ -125,7 +134,7 @@ fn assert_state(quirks: Quirks, name: &str, got: &[Vec<f64>]) {
 
 /// Fields as in `state_line` in `scripts/gen_fixtures.py`.
 fn state(v: &Voice) -> Vec<f64> {
-    vec![
+    let mut s = vec![
         v.position() as f64,
         v.saved_position() as f64,
         v.quant_phase(),
@@ -133,7 +142,11 @@ fn state(v: &Voice) -> Vec<f64> {
         v.rec_once() as u8 as f64,
         v.play() as u8 as f64,
         v.fade_time() as f64,
-    ]
+    ];
+    for h in v.heads() {
+        s.extend([h.position as f64, h.fade as f64, h.active as u8 as f64]);
+    }
+    s
 }
 
 const QUIRKS: [Quirks; 2] = [Quirks::Upstream, Quirks::Fixed];
@@ -165,6 +178,7 @@ fn run_voice_with(quirks: Quirks, name: &str, compare_output: bool, tol: f32) {
             "cut" => v.cut_to(w[1].parse().unwrap()),
             "stop" => v.stop(),
             "reset" => v.reset(),
+            "fill" => buf.fill(w[1].parse().unwrap()),
             op => panic!("unknown op {op}"),
         }
     }
@@ -227,6 +241,20 @@ fn fractional_loop() {
 #[test]
 fn rec_only() {
     run_voice("rec_only", false, TOL);
+}
+
+/// A raised pre curve under a linear rec curve: upstream ignores it, `Fixed`
+/// applies it.
+#[test]
+fn pre_curve_quirk() {
+    let name = "pre_curve_quirk";
+    let buf = |q| read_f32(result(q, name, "buf.f32"));
+    assert_ne!(
+        buf(Quirks::Upstream),
+        buf(Quirks::Fixed),
+        "fixtures must differ between modes to exercise the quirk"
+    );
+    run_voice(name, true, TOL);
 }
 
 #[test]
