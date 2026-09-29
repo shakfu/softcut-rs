@@ -32,7 +32,7 @@ First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-li
 #### softcut-demo
 
 - Four voices as two linked stereo pairs over L and R buffers, with waveform lanes showing loops and playheads, per-voice controls and a feedback matrix.
-- WAV load with windowed-sinc resampling, stereo 32-bit float WAV save, and loop clear and reverse.
+- WAV load with windowed-sinc resampling, saving the selected voice's loop region as a 32-bit float WAV (stereo for a linked pair), and loop clear and reverse.
 - Output recording: the mix of all voices to a stereo 32-bit float WAV, written by a separate thread so the audio thread does no file I/O.
 - Crossfade visualization: fade curves on each loop band, both heads drawn at their gain, and a plot of the rec and pre curves.
 - OSC control, with the controls following OSC changes.

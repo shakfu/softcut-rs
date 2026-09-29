@@ -4,7 +4,7 @@
 //!
 //! Waveform: click to cut the selected voice, drag to set its loop.
 //! WAV files load into the buffers from the button or by dropping them on the
-//! window, and save from the buffers with "save wav...".
+//! window; "save loop..." saves the selected voice's loop region.
 
 // Per-voice state lives in parallel arrays indexed by voice number.
 #![allow(clippy::needless_range_loop)]
@@ -441,6 +441,15 @@ fn fade_curve_plot(ui: &mut egui::Ui, v: &VoiceUi, sample_rate: f32, color: Colo
         font,
         dim,
     );
+}
+
+/// Frames and buffers to save for a voice's loop: its region, in either
+/// order, from both buffers for a linked stereo pair, else its own buffer.
+fn loop_save_plan(v: &VoiceUi, linked: bool, sample_rate: f32) -> (usize, usize, Vec<usize>) {
+    let frames = |t: f32| (t.max(0.0) * sample_rate).round() as usize;
+    let (a, b) = (frames(v.loop_start), frames(v.loop_end));
+    let buffers = if linked { vec![0, 1] } else { vec![v.buffer] };
+    (a.min(b), a.max(b), buffers)
 }
 
 /// A save waiting for both buffers' snapshots to come back.
@@ -1479,16 +1488,21 @@ impl eframe::App for App {
                     self.load_wav(&path);
                 }
                 if ui
-                    .button("save wav...")
-                    .on_hover_text("save both buffers, over the loaded sample's length, as stereo")
+                    .button("save loop...")
+                    .on_hover_text(
+                        "save the selected voice's loop region: stereo for a linked pair, \
+                         else mono from the voice's buffer",
+                    )
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .add_filter("WAV", &["wav"])
-                        .set_file_name("softcut.wav")
+                        .set_file_name("softcut-loop.wav")
                         .save_file()
                 {
-                    let end = (self.content_seconds() * self.audio.sample_rate) as usize;
-                    self.start_save(path, 0, end, &[0, 1]);
+                    let v = &self.voices[self.selected];
+                    let linked = self.linked[self.selected / 2];
+                    let (start, end, buffers) = loop_save_plan(v, linked, self.audio.sample_rate);
+                    self.start_save(path, start, end, &buffers);
                 }
                 self.record_button(ui);
                 if let Some(len) = self.sample_seconds
@@ -1775,5 +1789,23 @@ mod tests {
             .fade_zones()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn loop_save_plan_takes_the_region_and_channels() {
+        let v = VoiceUi {
+            loop_start: 1.0,
+            loop_end: 1.5,
+            buffer: 1,
+            ..VoiceUi::preset(0)
+        };
+        assert_eq!(loop_save_plan(&v, true, 1000.0), (1000, 1500, vec![0, 1]));
+        assert_eq!(loop_save_plan(&v, false, 1000.0), (1000, 1500, vec![1]));
+        let reversed = VoiceUi {
+            loop_start: 1.5,
+            loop_end: 1.0,
+            ..v
+        };
+        assert_eq!(loop_save_plan(&reversed, false, 1000.0).0, 1000);
     }
 }
