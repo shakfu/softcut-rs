@@ -6,6 +6,10 @@
 
 ## High
 
+- [ ] Golden fixtures do not check `rec`, `rec_once`, `play` or `fade_time`. softcut-py reports the last value set for these, not DSP state (`scripts/gen_fixtures.py:11`). After softcut-py reads them from softcut-lib (its TODO, High), add them to `.state` and regenerate. Until then the `rec_once` fixture checks audio and position only, not when the pass ends.
+
+- [ ] `Quirks::Fixed` has unit tests but no golden fixtures, because softcut-lib cannot produce its output. softcut-py is adding a matching quirks switch (its TODO, High). Once it lands, generate every scenario in both modes. Keep `Upstream` as the default: it is sample-exact with norns.
+
 ## Medium
 
 - [ ] softcut as a CLAP/VST3 plugin, built with [nice-plug](https://codeberg.org/RustAudio/nice-plug) (`nice-plug` 0.4, ISC; VST3 bindings MIT/Apache-2.0; `nice-plug-egui` uses egui 0.36, as the demo does; experimental per its README). A `softcut-plugin` crate would drive `Voice`/`Engine` from the host's process callback; `rt` is not needed, since the framework handles threading and parameter smoothing. Questions to settle:
@@ -17,5 +21,7 @@
 ## Low
 
 - [ ] Demo: host CLAP plugins in the effects chains with [clack](https://github.com/prokopyl/clack) (`clack-host` 0.2; CLAP only). Built-in effects exist (`softcut-fx`). A plugin's `process` runs on the audio thread, but CLAP also calls back on a main thread (parameters, state, GUI); loading and removing plugins needs a handover off the audio thread, like the buffer swap in `rt`. (nice-plug was ruled out: it builds plugins but does not host them.)
+
+- [ ] Audio device and WAV I/O live only in `softcut-demo`, so each host re-implements `softcut-osc`'s `ReadMono`/`WriteMono` actions and device setup. softcut-py puts both in the library. Move them into a crate only if a second host needs them.
 
 - [ ] Publish voice settings through `rt`, only if a host with several control sources needs them. Until then a shadow `Voice` on the control thread covers it (documented in `rt`).

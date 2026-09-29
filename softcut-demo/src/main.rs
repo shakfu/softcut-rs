@@ -242,6 +242,8 @@ struct Targets {
     loop_region: bool,
     pan_level: bool,
     filter: bool,
+    /// A random routing preset. Global, so only randomizing all voices sets it.
+    feedback: bool,
 }
 
 /// Octaves and fifths, so random rates stay in tune.
@@ -309,6 +311,56 @@ fn randomize_voices(
             voices[i ^ 1] = voices[i].partner();
         }
     }
+}
+
+/// Feedback routings, as (source, destination) voices. Voices 1+2 and 3+4
+/// are L+R pairs. Each destination gets at most one source, and each routing
+/// maps onto itself when L and R swap, so a linked pair stays a stereo pair.
+const ROUTINGS: [(&str, &[(usize, usize)]); 6] = [
+    ("off", &[]),
+    ("cascade", &[(0, 2), (1, 3)]),
+    ("cross", &[(0, 3), (1, 2)]),
+    ("exchange", &[(0, 2), (2, 0), (1, 3), (3, 1)]),
+    ("swap sides", &[(0, 1), (1, 0), (2, 3), (3, 2)]),
+    ("ring", &[(0, 2), (2, 1), (1, 3), (3, 0)]),
+];
+
+/// Largest preset amount. With one source per destination, the recorded
+/// level per pass stays below 1 at the preset `pre_level` and `rec_level`.
+const ROUTING_MAX: f32 = 0.4;
+
+/// The feedback matrix for `cells`, each at `amount`.
+fn routing(cells: &[(usize, usize)], amount: f32) -> [[f32; VOICES]; VOICES] {
+    let mut m = [[0.0; VOICES]; VOICES];
+    for &(src, dst) in cells {
+        m[src][dst] = amount;
+    }
+    m
+}
+
+/// Index into `ROUTINGS` of the preset `m` is, at any single amount.
+fn routing_of(m: &[[f32; VOICES]; VOICES]) -> Option<usize> {
+    let amount = m
+        .iter()
+        .flatten()
+        .copied()
+        .find(|&x| x != 0.0)
+        .unwrap_or(0.0);
+    ROUTINGS
+        .iter()
+        .position(|(_, cells)| routing(cells, amount) == *m)
+}
+
+/// Store `current` in `manual` unless it is a preset.
+fn keep_manual(manual: &mut [[f32; VOICES]; VOICES], current: &[[f32; VOICES]; VOICES]) {
+    if routing_of(current).is_none() {
+        *manual = *current;
+    }
+}
+
+/// A routing preset other than "off" (`ROUTINGS[0]`), drawn at random, at `amount`.
+fn random_routing(rng: &mut Rng, amount: f32) -> [[f32; VOICES]; VOICES] {
+    routing(rng.pick(&ROUTINGS[1..]).1, amount)
 }
 
 /// Where a voice's loop crossfades happen, in buffer seconds: the incoming
@@ -622,6 +674,10 @@ struct App {
     /// Per pair (voices 1+2, 3+4): edits to one voice apply to both.
     linked: [bool; VOICES / 2],
     feedback: [[f32; VOICES]; VOICES],
+    /// Level a routing preset sets its cells to.
+    routing_amount: f32,
+    /// The last matrix that was not a preset, restored by picking "manual".
+    manual: [[f32; VOICES]; VOICES],
     selected: usize,
     source: Source,
     drag_from: Option<f32>,
@@ -1254,6 +1310,7 @@ impl App {
                 for (i, v) in self.voices.iter().enumerate() {
                     v.diff(i, None, &mut cmds);
                 }
+                self.manual = [[0.0; VOICES]; VOICES];
                 for (src, dst) in (0..VOICES).flat_map(|s| (0..VOICES).map(move |d| (s, d))) {
                     self.feedback[src][dst] = 0.0;
                     cmds.push(EngineCmd::Feedback {
@@ -1319,6 +1376,10 @@ impl App {
             self.targets,
             content,
         );
+        if which.is_none() && self.targets.feedback {
+            let m = random_routing(&mut self.rng, self.routing_amount);
+            self.set_routing(m);
+        }
         self.last_random = now;
     }
 
@@ -1332,6 +1393,10 @@ impl App {
             ui.checkbox(&mut t.loop_region, "loop");
             ui.checkbox(&mut t.pan_level, "pan/level");
             ui.checkbox(&mut t.filter, "filter");
+            ui.checkbox(&mut t.feedback, "feedback").on_hover_text(
+                "a routing preset at the preset amount; \"all\" and the timer only, \
+                 as the matrix is shared",
+            );
             let now = ui.input(|i| i.time);
             if ui
                 .button(format!("voice {}", self.selected + 1))
@@ -1586,6 +1651,52 @@ impl App {
                 ui.end_row();
             }
         });
+        let current = routing_of(&self.feedback);
+        // Some(None) is "manual".
+        let mut pick = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("preset").on_hover_text(
+                "replace the matrix with a routing; \"manual\" restores the last matrix \
+                 that was not a preset. Feedback reaches a voice only while it records",
+            );
+            egui::ComboBox::from_id_salt("routing")
+                .selected_text(current.map_or("manual", |i| ROUTINGS[i].0))
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(current.is_none(), "manual").clicked() {
+                        pick = Some(None);
+                    }
+                    for (i, (name, _)) in ROUTINGS.iter().enumerate() {
+                        // Re-picking the current preset reapplies it at the amount.
+                        if ui.selectable_label(current == Some(i), *name).clicked() {
+                            pick = Some(Some(i));
+                        }
+                    }
+                });
+            ui.add(egui::Slider::new(&mut self.routing_amount, 0.0..=ROUTING_MAX).text("amount"))
+                .on_hover_text("level of each preset cell, applied on the next pick");
+        });
+        match pick {
+            Some(Some(i)) => self.set_routing(routing(ROUTINGS[i].1, self.routing_amount)),
+            Some(None) => self.set_feedback(self.manual),
+            None => {}
+        }
+    }
+
+    /// Apply a preset matrix, first keeping the current one if it is manual.
+    fn set_routing(&mut self, m: [[f32; VOICES]; VOICES]) {
+        keep_manual(&mut self.manual, &self.feedback);
+        self.set_feedback(m);
+    }
+
+    /// Replace the feedback matrix, sending only the cells that change.
+    fn set_feedback(&mut self, m: [[f32; VOICES]; VOICES]) {
+        for (src, dst) in (0..VOICES).flat_map(|s| (0..VOICES).map(move |d| (s, d))) {
+            let amount = m[src][dst];
+            if self.feedback[src][dst] != amount {
+                self.feedback[src][dst] = amount;
+                self.send(EngineCmd::Feedback { src, dst, amount });
+            }
+        }
     }
 }
 
@@ -1753,6 +1864,8 @@ impl App {
             voices: std::array::from_fn(VoiceUi::preset),
             linked: [true; VOICES / 2],
             feedback: [[0.0; VOICES]; VOICES],
+            routing_amount: 0.3,
+            manual: [[0.0; VOICES]; VOICES],
             selected: 0,
             source: Source::Off,
             drag_from: None,
@@ -1768,6 +1881,7 @@ impl App {
                 loop_region: true,
                 pan_level: true,
                 filter: true,
+                feedback: false,
             },
             auto_random: false,
             auto_seconds: 4.0,
@@ -1872,6 +1986,7 @@ mod tests {
         loop_region: true,
         pan_level: true,
         filter: true,
+        feedback: true,
     };
 
     #[test]
@@ -1900,6 +2015,7 @@ mod tests {
             loop_region: false,
             pan_level: false,
             filter: false,
+            feedback: false,
         };
         v.randomize(&mut rng, t, 3.0);
         assert_eq!(
@@ -2008,5 +2124,80 @@ mod tests {
                 FxCmd::ReverbMix(0.1)
             ]
         );
+    }
+
+    #[test]
+    fn routings_keep_pairs_stereo_and_one_source_per_voice() {
+        for (name, cells) in ROUTINGS {
+            let m = routing(cells, 1.0);
+            let mut n = 0;
+            for src in 0..VOICES {
+                for dst in 0..VOICES {
+                    n += (m[src][dst] != 0.0) as usize;
+                    assert_eq!(m[src][dst], m[src ^ 1][dst ^ 1], "{name}: not mirrored");
+                }
+            }
+            assert_eq!(n, cells.len(), "{name}: duplicate cell");
+            for dst in 0..VOICES {
+                let sources = (0..VOICES).filter(|&s| m[s][dst] != 0.0).count();
+                assert!(
+                    sources <= 1,
+                    "{name}: voice {} has {sources} sources",
+                    dst + 1
+                );
+            }
+        }
+    }
+
+    /// Sufficient for stability: per pass, a destination keeps `pre` of its
+    /// content and records `rec * amount` of one source.
+    #[test]
+    fn routing_max_decays_at_preset_levels() {
+        for i in 0..VOICES {
+            let v = VoiceUi::preset(i);
+            let gain = v.pre_level + v.rec_level * ROUTING_MAX;
+            assert!(gain < 1.0, "voice {}: loop gain {gain}", i + 1);
+        }
+    }
+
+    #[test]
+    fn random_routing_draws_every_preset_but_off_at_amount() {
+        assert_eq!(ROUTINGS[0], ("off", &[][..]));
+        let mut rng = Rng(5);
+        let mut seen = [false; ROUTINGS.len()];
+        for _ in 0..200 {
+            let m = random_routing(&mut rng, 0.25);
+            let i = ROUTINGS
+                .iter()
+                .position(|(_, cells)| routing(cells, 0.25) == m)
+                .expect("not a preset");
+            seen[i] = true;
+        }
+        assert!(!seen[0] && seen[1..].iter().all(|&s| s), "{seen:?}");
+    }
+
+    #[test]
+    fn routing_of_names_presets_and_not_edits() {
+        for (i, (_, cells)) in ROUTINGS.iter().enumerate() {
+            assert_eq!(routing_of(&routing(cells, 0.3)), Some(i));
+        }
+        let mut m = routing(ROUTINGS[1].1, 0.3);
+        m[0][0] = 0.1;
+        assert_eq!(routing_of(&m), None);
+        m = routing(ROUTINGS[1].1, 0.3);
+        m[0][2] = 0.2;
+        assert_eq!(routing_of(&m), None, "unequal amounts");
+    }
+
+    #[test]
+    fn keep_manual_stores_edits_but_not_presets() {
+        let mut manual = [[0.0; VOICES]; VOICES];
+        let mut edited = routing(ROUTINGS[1].1, 0.3);
+        edited[0][0] = 0.1;
+        keep_manual(&mut manual, &edited);
+        assert_eq!(manual, edited);
+        // A preset over a preset keeps the edit.
+        keep_manual(&mut manual, &routing(ROUTINGS[2].1, 0.3));
+        assert_eq!(manual, edited);
     }
 }

@@ -540,7 +540,9 @@ fn open_output(
             None,
         )
         .map_err(|e| e.to_string())?;
-    stream.pause().map_err(|e| e.to_string())?;
+    // Some backends start on build. ALSA does not, and rejects pausing a
+    // not-yet-started PCM with EBADFD, so the error is ignored.
+    let _ = stream.pause();
     Ok((stream, cfg.sample_rate()))
 }
 
@@ -619,7 +621,9 @@ fn open_input(
             None,
         )
         .map_err(|e| e.to_string())?;
-    stream.pause().map_err(|e| e.to_string())?;
+    // Some backends start on build. ALSA does not, and rejects pausing a
+    // not-yet-started PCM with EBADFD, so the error is ignored.
+    let _ = stream.pause();
     Ok((stream, channels, dev_rate))
 }
 

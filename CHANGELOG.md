@@ -42,6 +42,7 @@ First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-li
 - Effects: a mono chain on each voice and a stereo chain on the mix.
 - Crossfade visualization: fade curves on each loop band, both heads drawn at their gain, and a plot of the rec and pre curves.
 - OSC control, with the controls following OSC changes.
+- Feedback routing presets (off, cascade, cross, exchange, swap sides, ring) alongside the manual matrix. Each gives a voice at most one source and is symmetric across L and R, so linked pairs stay stereo. Amount is capped at 0.4 so feedback decays at the preset `pre_level` and `rec_level`. Picking a preset keeps a hand-edited matrix, which "manual" restores. Randomizing all voices can draw one, opt-in, since feedback writes into the buffers.
 - Randomization of rate, loop region, pan and level, and filter, per voice or for all voices, once or on a timer. Rates are drawn from octaves and fifths so results stay in tune.
 - Input and output device selection. Devices at other rates, input or output, are resampled live, and resampled input is steered against clock drift rather than dropping or padding frames. Output devices appear as system-audio sources on macOS 14.6+ and Windows. The status line reports an input that is exactly silent, which on macOS usually means a missing permission.
 
