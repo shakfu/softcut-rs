@@ -2,13 +2,17 @@
 
 ## Critical
 
-- [ ] Verify the first CI run (`.github/workflows/ci.yml`). The golden fixtures were recorded on arm64; check that parity holds on x86-64 Linux and Windows, whose libms may differ from macOS on `sin`, `exp` and `tan`. The Linux package list was inferred from build scripts, not tested.
+- [x] Verify the first CI run (`.github/workflows/ci.yml`). The golden fixtures were recorded on arm64; check that parity holds on x86-64 Linux and Windows, whose libms may differ from macOS on `sin`, `exp` and `tan`. The Linux package list was inferred from build scripts, not tested. Done: lint and tests pass on macOS, Ubuntu and Windows ([runs](https://github.com/shakfu/softcut-rs/actions)).
 
 ## High
 
-- [ ] Golden fixtures do not check `rec`, `rec_once`, `play` or `fade_time`. softcut-py reports the last value set for these, not DSP state (`scripts/gen_fixtures.py:11`). After softcut-py reads them from softcut-lib (its TODO, High), add them to `.state` and regenerate. Until then the `rec_once` fixture checks audio and position only, not when the pass ends.
+- [x] Golden fixtures do not check `rec`, `rec_once`, `play` or `fade_time`. Done: `.state` records all four, so the `rec_once` fixture now checks when the pass ends, to the block.
 
-- [ ] `Quirks::Fixed` has unit tests but no golden fixtures, because softcut-lib cannot produce its output. softcut-py is adding a matching quirks switch (its TODO, High). Once it lands, generate every scenario in both modes. Keep `Upstream` as the default: it is sample-exact with norns.
+- [x] `Quirks::Fixed` has unit tests but no golden fixtures. Done: every voice and engine scenario also runs under `Fixed`, against `fixtures/fixed/`. `Upstream` stays the default.
+
+- [ ] The golden fixtures, including `fixtures/fixed/`, were generated from softcut-py's uncommitted working tree (quirks switch and DSP read-backs). Once softcut-py commits that work, regenerate with `make fixtures` and confirm the files are unchanged.
+
+- [ ] No golden scenario covers the pre-curve quirk (`calcPreFade` testing `recShape`): it applies only with a `Raised` pre shape over a non-`Raised` rec shape, and softcut-py cannot set fade shapes yet (its TODO, Medium). Add a scenario once it can.
 
 ## Medium
 

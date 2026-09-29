@@ -19,7 +19,7 @@ First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-li
 - `Voice::heads` (both crossfading heads' position, fade and gain) and `rec_fade_value`/`pre_fade_value`, for visualizing crossfades; `rt::Handle::heads` publishes the heads.
 - `buffer`: norns buffer operations (write, clear, copy) on slices, and `EngineCmd::ClearRegion` and `CopyRegion` to run them on the audio thread. Copies within one buffer need no temporary; a reversed copy between partly overlapping regions is refused rather than allocating.
 - `rt` (feature `rtrb`): a `Handle` for the control thread and a `Processor` for the audio thread. Commands, buffer loads, writes and snapshots share one ring, so they apply in the order sent. Every buffer sent comes back to the control thread, so the audio thread never frees memory.
-- Golden tests against softcut-lib, run through softcut-py. The README's "Parity with the C++ engine" section gives tolerances and deviations. A separate test checks that faded loop wraps, in playback and overdub, add no click.
+- Golden tests against softcut-lib, run through softcut-py, under both `Quirks` modes. They check the `rec`, `rec_once` and `fade_time` that softcut-lib changes itself, as well as audio and position. The README's "Parity with the C++ engine" section gives tolerances and deviations. A separate test checks that faded loop wraps, in playback and overdub, add no click.
 
 #### softcut-fx
 

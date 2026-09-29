@@ -1,11 +1,13 @@
 //! Replays scenarios recorded from the C++ softcut-lib (via softcut-py) and
-//! compares output, buffer contents and head positions.
+//! compares output, buffer contents, head positions and the flags softcut-lib
+//! changes itself (`rec`, `rec_once`, `fade_time`). Each voice and engine
+//! scenario runs under both [`Quirks`] modes.
 //! Fixtures come from `scripts/gen_fixtures.py`.
 
 use std::fs;
 use std::path::PathBuf;
 
-use softcut::{Engine, EngineCmd, EngineConfig, Voice, VoiceCmd, buffer};
+use softcut::{Engine, EngineCmd, EngineConfig, Quirks, Voice, VoiceCmd, buffer};
 
 const SR: f32 = 48000.0;
 const FRAMES: usize = 1 << 15;
@@ -23,8 +25,16 @@ fn fixture(name: &str, ext: &str) -> PathBuf {
         .join(format!("{name}.{ext}"))
 }
 
-fn read_f32(name: &str, ext: &str) -> Vec<f32> {
-    let bytes = fs::read(fixture(name, ext)).unwrap();
+/// A fixture recorded under `quirks`: `Fixed` results live in `fixed/`.
+fn result(quirks: Quirks, name: &str, ext: &str) -> PathBuf {
+    match quirks {
+        Quirks::Upstream => fixture(name, ext),
+        Quirks::Fixed => fixture(&format!("fixed/{name}"), ext),
+    }
+}
+
+fn read_f32(path: PathBuf) -> Vec<f32> {
+    let bytes = fs::read(path).unwrap();
     bytes
         .as_chunks::<4>()
         .0
@@ -33,8 +43,8 @@ fn read_f32(name: &str, ext: &str) -> Vec<f32> {
         .collect()
 }
 
-fn read_state(name: &str) -> Vec<Vec<f64>> {
-    fs::read_to_string(fixture(name, "state"))
+fn read_state(quirks: Quirks, name: &str) -> Vec<Vec<f64>> {
+    fs::read_to_string(result(quirks, name, "state"))
         .unwrap()
         .lines()
         .map(|l| l.split_whitespace().map(|w| w.parse().unwrap()).collect())
@@ -99,31 +109,45 @@ fn assert_close(what: &str, got: &[f32], want: &[f32], tol: f32) {
     );
 }
 
-fn assert_state(name: &str, got: &[Vec<f64>]) {
-    let want = read_state(name);
+fn assert_state(quirks: Quirks, name: &str, got: &[Vec<f64>]) {
+    let want = read_state(quirks, name);
     assert_eq!(got.len(), want.len(), "{name}: state count");
     for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(g.len(), w.len(), "{name}: state {k} field count");
         for (j, (a, b)) in g.iter().zip(w).enumerate() {
             assert!(
                 (a - b).abs() < 1e-5,
-                "{name}: state {k} field {j}: got {a}, want {b}"
+                "{name} {quirks:?}: state {k} field {j}: got {a}, want {b}"
             );
         }
     }
 }
 
+/// Fields as in `state_line` in `scripts/gen_fixtures.py`.
 fn state(v: &Voice) -> Vec<f64> {
     vec![
         v.position() as f64,
         v.saved_position() as f64,
         v.quant_phase(),
+        v.rec() as u8 as f64,
+        v.rec_once() as u8 as f64,
+        v.play() as u8 as f64,
+        v.fade_time() as f64,
     ]
 }
 
+const QUIRKS: [Quirks; 2] = [Quirks::Upstream, Quirks::Fixed];
+
 fn run_voice(name: &str, compare_output: bool, tol: f32) {
-    let input = read_f32(name, "in.f32");
+    for q in QUIRKS {
+        run_voice_with(q, name, compare_output, tol);
+    }
+}
+
+fn run_voice_with(quirks: Quirks, name: &str, compare_output: bool, tol: f32) {
+    let input = read_f32(fixture(name, "in.f32"));
     let ops = fs::read_to_string(fixture(name, "ops")).unwrap();
-    let mut v = Voice::new(SR);
+    let mut v = Voice::with_quirks(SR, quirks);
     let mut buf = vec![0.0f32; FRAMES];
     let (mut pos, mut out, mut states) = (0, Vec::new(), Vec::new());
     for line in ops.lines() {
@@ -146,19 +170,19 @@ fn run_voice(name: &str, compare_output: bool, tol: f32) {
     }
     if compare_output {
         assert_close(
-            &format!("{name} output"),
+            &format!("{name} {quirks:?} output"),
             &out,
-            &read_f32(name, "out.f32"),
+            &read_f32(result(quirks, name, "out.f32")),
             tol,
         );
     }
     assert_close(
-        &format!("{name} buffer"),
+        &format!("{name} {quirks:?} buffer"),
         &buf,
-        &read_f32(name, "buf.f32"),
+        &read_f32(result(quirks, name, "buf.f32")),
         tol,
     );
-    assert_state(name, &states);
+    assert_state(quirks, name, &states);
 }
 
 #[test]
@@ -207,8 +231,14 @@ fn rec_only() {
 
 #[test]
 fn engine_feedback() {
+    for q in QUIRKS {
+        engine_feedback_with(q);
+    }
+}
+
+fn engine_feedback_with(quirks: Quirks) {
     let name = "engine_feedback";
-    let input = read_f32(name, "in.f32");
+    let input = read_f32(fixture(name, "in.f32"));
     let ops = fs::read_to_string(fixture(name, "ops")).unwrap();
     let mut e = Engine::new(EngineConfig {
         sample_rate: SR,
@@ -217,6 +247,7 @@ fn engine_feedback() {
         buffer_frames: FRAMES,
         block_size: 64,
         out_channels: 2,
+        quirks,
         ..Default::default()
     });
     let (mut pos, mut out, mut states) = (0, Vec::new(), Vec::new());
@@ -248,21 +279,26 @@ fn engine_feedback() {
             op => panic!("unknown op {op}"),
         }
     }
-    assert_close("engine output", &out, &read_f32(name, "out.f32"), TOL);
     assert_close(
-        "engine buffer",
-        &e.buffers()[0],
-        &read_f32(name, "buf.f32"),
+        &format!("engine {quirks:?} output"),
+        &out,
+        &read_f32(result(quirks, name, "out.f32")),
         TOL,
     );
-    assert_state(name, &states);
+    assert_close(
+        &format!("engine {quirks:?} buffer"),
+        &e.buffers()[0],
+        &read_f32(result(quirks, name, "buf.f32")),
+        TOL,
+    );
+    assert_state(quirks, name, &states);
 }
 
 #[test]
 fn buffer_ops() {
     let name = "buffer_ops";
-    let mut buf = read_f32(name, "in.f32");
-    let src = read_f32(name, "src.f32");
+    let mut buf = read_f32(fixture(name, "in.f32"));
+    let src = read_f32(fixture(name, "src.f32"));
     let ops = fs::read_to_string(fixture(name, "ops")).unwrap();
     for line in ops.lines() {
         let w: Vec<&str> = line.split_whitespace().collect();
@@ -274,5 +310,5 @@ fn buffer_ops() {
             op => panic!("unknown op {op}"),
         }
     }
-    assert_close("buffer ops", &buf, &read_f32(name, "buf.f32"), TOL);
+    assert_close("buffer ops", &buf, &read_f32(fixture(name, "buf.f32")), TOL);
 }

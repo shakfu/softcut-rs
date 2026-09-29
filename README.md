@@ -96,7 +96,7 @@ In the demo, tick "OSC" to listen. Indices beyond its 4 voices and 2 buffers are
 
 ## Parity with the C++ engine
 
-`softcut/tests/golden.rs` replays 10 scenarios recorded from softcut-lib through softcut-py. The scenarios cover recording, overdub, varispeed in both directions, loop points between samples, filters, rec-once, one-shot, phase quantization, engine feedback and buffer operations. Output, buffer contents and head positions match within 1.2e-7. The exception is varispeed with rate slew, at 7.6e-5: clang fuses the slew update into an FMA on arm64 and Rust does not. `make fixtures` regenerates the fixtures; see `scripts/gen_fixtures.py`.
+`softcut/tests/golden.rs` replays 10 scenarios recorded from softcut-lib through softcut-py. The scenarios cover recording, overdub, varispeed in both directions, loop points between samples, filters, rec-once, one-shot, phase quantization, engine feedback and buffer operations. Each voice and engine scenario runs under both `Quirks` modes. Output, buffer contents, head positions, `rec`, `rec_once`, `play` and `fade_time` match within 1.2e-7. The exception is varispeed with rate slew, at 7.6e-5: clang fuses the slew update into an FMA on arm64 and Rust does not. No scenario sets fade shapes, so the pre-curve quirk has unit tests only. `make fixtures` regenerates the fixtures; see `scripts/gen_fixtures.py`.
 
 `softcut/tests/loop_crossfade.rs` tests the crossfades themselves rather than parity: a looped sine, played back and overdubbed, wraps without a jump larger than the sine's own step when faded, and clicks without a fade.
 

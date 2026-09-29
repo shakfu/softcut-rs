@@ -8,8 +8,10 @@ and writes, per scenario, into softcut/tests/fixtures/:
   <name>.out.f32  output of every `process` op, concatenated
   <name>.buf.f32  final contents of buffer 0
   <name>.state    per `process` op: position saved_position quant_phase
-                  (Python's rec/play readbacks mirror the last set value, not DSP
-                  state, so they are omitted)
+                  rec rec_once play fade_time
+
+Voice and engine scenarios run under quirks="upstream" into fixtures/, and under
+quirks="fixed" into fixtures/fixed/ (out, buf and state; ops and in are shared).
 
 Pass scenario names to regenerate only those; with none, all are written.
 
@@ -29,6 +31,7 @@ import softcut
 SR = 48000.0
 FRAMES = 1 << 15
 OUT = pathlib.Path(__file__).resolve().parent.parent / "softcut" / "tests" / "fixtures"
+QUIRKS = {"upstream": OUT, "fixed": OUT / "fixed"}
 
 BOOLS = {"rec", "play", "loop", "rec_once"}
 
@@ -244,21 +247,29 @@ def f32(xs):
     return array.array("f", xs)
 
 
-def save(name, ops, inp, out, buf, states):
-    (OUT / f"{name}.ops").write_text(ops)
-    for suffix, data in (("in", inp), ("out", out), ("buf", buf)):
-        with open(OUT / f"{name}.{suffix}.f32", "wb") as fh:
+def save(name, quirks, ops, inp, out, buf, states):
+    out_dir = QUIRKS[quirks]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = [("out", out), ("buf", buf)]
+    if quirks == "upstream":
+        (OUT / f"{name}.ops").write_text(ops)
+        files.append(("in", inp))
+    for suffix, data in files:
+        with open(out_dir / f"{name}.{suffix}.f32", "wb") as fh:
             f32(data).tofile(fh)
-    (OUT / f"{name}.state").write_text("".join(states))
+    (out_dir / f"{name}.state").write_text("".join(states))
 
 
 def state_line(v):
-    return f"{v.position!r} {v.saved_position!r} {v.quant_phase!r}\n"
+    return (
+        f"{v.position!r} {v.saved_position!r} {v.quant_phase!r} "
+        f"{int(v.rec)} {int(v.rec_once)} {int(v.play)} {v.fade_time!r}\n"
+    )
 
 
-def run_voice(name, inp, ops):
+def run_voice(name, quirks, inp, ops):
     ops = "\n".join(line.strip() for line in ops.strip().splitlines()) + "\n"
-    v = softcut.Voice(SR)
+    v = softcut.Voice(SR, quirks=quirks)
     buf = f32([0.0] * FRAMES)
     v.buffer = buf
     pos, out, states = 0, [], []
@@ -273,12 +284,14 @@ def run_voice(name, inp, ops):
             states.append(state_line(v))
         else:
             apply_voice_op(v, words)
-    save(name, ops, inp, out, buf, states)
+    save(name, quirks, ops, inp, out, buf, states)
 
 
-def run_engine(name, inp, ops):
+def run_engine(name, quirks, inp, ops):
     ops = "\n".join(line.strip() for line in ops.strip().splitlines()) + "\n"
-    eng = softcut.Engine(voices=2, mode="playback", sample_rate=SR, block_size=64)
+    eng = softcut.Engine(
+        voices=2, mode="playback", sample_rate=SR, block_size=64, quirks=quirks
+    )
     buf = eng.allocate(frames=FRAMES)
     pos, out, states = 0, [], []
     for line in ops.splitlines():
@@ -298,7 +311,7 @@ def run_engine(name, inp, ops):
             eng.feedback(int(w[1]), int(w[2]), float(w[3]))
         else:
             raise ValueError(w[0])
-    save(name, ops, inp, out, buf, states)
+    save(name, quirks, ops, inp, out, buf, states)
 
 
 # Buffer ops: blended writes and clears through softcut-py's `_buffer_apply`
@@ -346,11 +359,12 @@ def main():
         sys.exit(f"unknown scenarios: {sorted(unknown)}; known: {known}")
     OUT.mkdir(parents=True, exist_ok=True)
     for name in names:
-        if name in VOICE_SCENARIOS:
-            run_voice(name, *VOICE_SCENARIOS[name])
-        elif name in ENGINE_SCENARIOS:
-            run_engine(name, *ENGINE_SCENARIOS[name])
-        else:
+        for quirks in QUIRKS:
+            if name in VOICE_SCENARIOS:
+                run_voice(name, quirks, *VOICE_SCENARIOS[name])
+            elif name in ENGINE_SCENARIOS:
+                run_engine(name, quirks, *ENGINE_SCENARIOS[name])
+        if name == "buffer_ops":
             run_buffer_ops()
     print(f"wrote {len(names)} scenarios to {OUT}")
 
