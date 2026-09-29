@@ -62,19 +62,21 @@ pub fn load(path: &Path, rate: f32, frames: usize) -> Result<Loaded, String> {
     })
 }
 
-/// Write `left` and `right` as a stereo 32-bit float WAV, lossless for
-/// softcut's f32 buffers. The shorter channel sets the length.
-pub fn save(path: &Path, left: &[f32], right: &[f32], rate: u32) -> Result<(), String> {
+/// Write `channels` (one per file channel) as a 32-bit float WAV, lossless
+/// for softcut's f32 buffers. The shortest channel sets the length.
+pub fn save(path: &Path, channels: &[&[f32]], rate: u32) -> Result<(), String> {
     let spec = hound::WavSpec {
-        channels: 2,
+        channels: channels.len() as u16,
         sample_rate: rate,
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
+    let frames = channels.iter().map(|c| c.len()).min().unwrap_or(0);
     let mut w = hound::WavWriter::create(path, spec).map_err(|e| e.to_string())?;
-    for (&l, &r) in left.iter().zip(right) {
-        w.write_sample(l).map_err(|e| e.to_string())?;
-        w.write_sample(r).map_err(|e| e.to_string())?;
+    for i in 0..frames {
+        for c in channels {
+            w.write_sample(c[i]).map_err(|e| e.to_string())?;
+        }
     }
     w.finalize().map_err(|e| e.to_string())
 }
@@ -143,7 +145,7 @@ mod tests {
         let left: Vec<f32> = (0..500).map(|i| (i as f32 * 0.01).sin()).collect();
         let right: Vec<f32> = left.iter().map(|x| -x * 0.5).collect();
         let path = temp("roundtrip");
-        save(&path, &left, &right, 44100).unwrap();
+        save(&path, &[&left, &right], 44100).unwrap();
         let l = load(&path, 44100.0, 1024).unwrap();
         std::fs::remove_file(path).ok();
         assert_eq!(l.source_rate, 44100);

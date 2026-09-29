@@ -8,10 +8,6 @@
 
 ## Medium
 
-- [ ] Demo: add randomization
-
 ## Low
 
 - [ ] Publish voice settings through `rt`, only if a host with several control sources needs them. Until then a shadow `Voice` on the control thread covers it (documented in `rt`).
-
-- [ ] OSC control, and a layer mirroring the norns Lua API. Only needed to run existing norns scripts.

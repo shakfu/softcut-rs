@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["softcut", "softcut-demo"]
+members = ["softcut", "softcut-demo", "softcut-osc"]
 
 [workspace.package]
 edition = "2024"

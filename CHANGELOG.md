@@ -4,7 +4,7 @@ All notable changes to this project. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
-First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-lib), and an egui demo.
+First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-lib), OSC control over its reference protocol, and an egui demo.
 
 ### Added
 
@@ -19,10 +19,21 @@ First version: a Rust port of [softcut-lib](https://github.com/monome/softcut-li
 - `rt` (feature `rtrb`): a `Handle` for the control thread and a `Processor` for the audio thread. Commands, buffer loads, writes and snapshots share one ring, so they apply in the order sent. Every buffer sent comes back to the control thread, so the audio thread never frees memory.
 - Golden tests against softcut-lib, run through softcut-py. The README's "Parity with the C++ engine" section gives tolerances and deviations. A separate test checks that faded loop wraps, in playback and overdub, add no click.
 
+#### softcut-osc
+
+- OSC control over the protocol of softcut-lib's reference client, `softcut_jack_osc`, which norns uses to drive its audio engine. Indices are 0-based. Covers every `/set/param/cut/*` setting, level, pan, input and feedback routing, `/softcut/buffer/*` reads, writes and clears, `/softcut/reset`, and the phase poll.
+- `parse`: one OSC message to `Action`s, mostly `EngineCmd`s. File reads and writes, reset and the phase poll are left to the host, which owns files and threads.
+- `Server`: receives UDP on its own thread and forwards actions over a bounded channel, so the host applies them through its one control path, such as an `rt::Handle`. It listens on loopback by default, because the protocol writes files at paths the sender names. A full channel drops actions and counts them.
+- `PhasePoll`: reports each voice's quantized position as `/poll/softcut/phase i f` when it changes.
+- Arguments are type-checked, ints and floats coerced as the reference's liblo does, and non-finite numbers rejected before they reach the engine.
+- `level_slew_time`, `pan_slew_time`, `/set/enabled/cut`, the VU poll and `/quit` are accepted and ignored: the engine has no counterpart, and a network message does not quit the host.
+
 #### softcut-demo
 
 - Four voices as two linked stereo pairs over L and R buffers, with waveform lanes showing loops and playheads, per-voice controls and a feedback matrix.
 - WAV load with windowed-sinc resampling, stereo 32-bit float WAV save, and loop clear and reverse.
+- OSC control, with the controls following OSC changes.
+- Randomization of rate, loop region, pan and level, and filter, per voice or for all voices, once or on a timer. Rates are drawn from octaves and fifths so results stay in tune.
 - Input and output device selection. Devices at other rates, input or output, are resampled live, and resampled input is steered against clock drift rather than dropping or padding frames. Output devices appear as system-audio sources on macOS 14.6+ and Windows. The status line reports an input that is exactly silent, which on macOS usually means a missing permission.
 
 [Unreleased]: https://github.com/shakfu/softcut-rs/commits/main

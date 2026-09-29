@@ -7,7 +7,8 @@ Rust port of [softcut-lib](https://github.com/monome/softcut-lib), the looping e
 | Crate | Purpose | Dependencies |
 |-|-|-|
 | `softcut` | The DSP library, for embedding in a Rust audio host | none; `rtrb` optional |
-| `softcut-demo` | egui app: stereo live looping with the buffers, loops and playheads drawn | cpal, eframe, rtrb, hound, rfd |
+| `softcut-osc` | OSC control over softcut-lib's `softcut_jack_osc` protocol | softcut, rosc |
+| `softcut-demo` | egui app: stereo live looping with the buffers, loops and playheads drawn | cpal, eframe, rtrb, hound, rfd, softcut-osc |
 
 ## Library
 
@@ -74,6 +75,20 @@ The ring has one producer. Hosts with several control sources must serialize the
 
 To read settings back on the control thread, keep a shadow `Voice` there: apply each `VoiceCmd` to it before sending, and read its getters. The `rt` module docs show the pattern and its limits.
 
+## OSC
+
+`softcut-osc` speaks the protocol of softcut-lib's reference client, `softcut_jack_osc`: the messages norns sends to its audio engine, with 0-based voice and buffer indices. Every `/set/param/cut/*` setting, the mix and routing messages (`/set/level/cut`, `/set/pan/cut`, `/set/level/in_cut`, `/set/level/cut_cut`), the `/softcut/buffer/*` read, write and clear messages, `/softcut/reset` and the phase poll are supported.
+
+- `parse` turns a message into `Action`s, mostly `EngineCmd`s. File reads and writes, reset and the phase poll are left to the host.
+- `Server` receives UDP on its own thread and forwards actions over a bounded channel, so the host applies them through its one control path, such as an `rt::Handle`.
+- `PhasePoll` reports quantized positions as `/poll/softcut/phase i f`.
+
+It listens on 127.0.0.1:9999 by default. The reference listens on all interfaces, but the protocol writes files at paths the sender names. Non-finite numbers are rejected; ints and floats are coerced, as the reference's liblo does.
+
+Ignored, since the engine has no counterpart: `level_slew_time`, `pan_slew_time`, `/set/enabled/cut` (voices are always enabled), the VU poll, and `/quit`. The protocol lets existing norns-style controllers drive the engine; running norns Lua scripts themselves would need matron, norns' Lua runtime, which is out of scope.
+
+In the demo, tick "OSC" to listen. Indices beyond its 4 voices and 2 buffers are ignored. The phase poll runs once per UI frame, not every millisecond as in the reference. File reads are resampled to the engine's rate; the reference reads at the file's rate. `/softcut/reset` restores the demo's startup state, where the reference silences and disables every voice.
+
 ## Parity with the C++ engine
 
 `softcut/tests/golden.rs` replays 10 scenarios recorded from softcut-lib through softcut-py. The scenarios cover recording, overdub, varispeed in both directions, loop points between samples, filters, rec-once, one-shot, phase quantization, engine feedback and buffer operations. Output, buffer contents and head positions match within 1.2e-7. The exception is varispeed with rate slew, at 7.6e-5: clang fuses the slew update into an FMA on arm64 and Rust does not. `make fixtures` regenerates the fixtures; see `scripts/gen_fixtures.py`.
@@ -102,7 +117,9 @@ make demo
 
 Four voices run over a stereo pair of 43.7 s buffers (at 48 kHz), L and R, as two linked stereo pairs: voices 1+2 and 3+4. Editing one voice of a linked pair applies to both, on opposite buffers with mirrored pan; untick "link" to control them separately. Each voice records the input channel matching its buffer. Voices 1+2 record when you press rec; voices 3+4 play back at half speed, reversed, through a lowpass. The input row picks any recording device (a mic, an interface, a virtual device such as BlackHole) and, on devices with more than two inputs, which channel pair feeds L and R. A mono device feeds both. On macOS 14.6+ and Windows it also lists output devices as "system audio" sources, which capture everything playing on that device, softcut included, so recording one while softcut plays feeds back. The input is off at startup, and its stream stays paused while off. If an input delivers nothing, or only exact silence, for 2 s, the status line says so; on macOS exact silence usually means the terminal lacks the Microphone or System Audio Recording permission. System-audio capture is verified on macOS 26.7 with that permission granted, and delivers exact silence without it. The same row picks the output device. The engine uses `Quirks::Fixed`, so recordings keep the input's polarity. "crossfade curves" sets each voice's fade shapes and ratios.
 
-"load wav..." or dropping a file on the window loads a WAV into both buffers: stereo files split L/R, mono files fill both. Files at another rate are resampled to the device rate with a Kaiser-windowed sinc (cutoff at 95% of the lower Nyquist, about 80 dB stopband), then truncated to fit. Loading stops recording and loops every voice over the file. "save wav..." writes both buffers, over the loaded sample's length, to a stereo 32-bit float WAV. "clear loop" silences the selected voice's loop region; "reverse loop" reverses it in place. The waveform zooms to the sample on load; "fit sample" and "full buffer" switch between the two views. On the waveform, click to cut the selected voice, drag to set its loop. The engine runs at the startup output device's rate. A device without that rate, input or output, is opened at its nearest rate and resampled live with the same windowed sinc as WAV loads. Input is read with about 23 ms of queued headroom. Resampled input is steered against clock drift: the resampling ratio moves by up to 0.2% to hold that headroom steady. A same-rate input is not resampled, so drift there is absorbed by occasionally dropping or padding frames. A failed switch leaves the previous device open.
+"load wav..." or dropping a file on the window loads a WAV into both buffers: stereo files split L/R, mono files fill both. Files at another rate are resampled to the device rate with a Kaiser-windowed sinc (cutoff at 95% of the lower Nyquist, about 80 dB stopband), then truncated to fit. Loading stops recording and loops every voice over the file. "save wav..." writes both buffers, over the loaded sample's length, to a stereo 32-bit float WAV. "clear loop" silences the selected voice's loop region; "reverse loop" reverses it in place.
+
+The "randomize" row draws new values for the selected voice or all voices, for any of: rate (octaves and fifths, sometimes reversed), loop region (within the loaded sample), pan and level, and filter (cutoff, resonance and type, or none). "auto every" repeats it for all voices on a timer. A linked pair gets one draw, mirrored, so it stays a stereo pair. The waveform zooms to the sample on load; "fit sample" and "full buffer" switch between the two views. On the waveform, click to cut the selected voice, drag to set its loop. The engine runs at the startup output device's rate. A device without that rate, input or output, is opened at its nearest rate and resampled live with the same windowed sinc as WAV loads. Input is read with about 23 ms of queued headroom. Resampled input is steered against clock drift: the resampling ratio moves by up to 0.2% to hold that headroom steady. A same-rate input is not resampled, so drift there is absorbed by occasionally dropping or padding frames. A failed switch leaves the previous device open.
 
 ## Development
 

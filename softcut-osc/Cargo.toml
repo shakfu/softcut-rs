@@ -1,0 +1,11 @@
+[package]
+name = "softcut-osc"
+version = "0.1.0"
+description = "OSC control for the softcut crate, over softcut-lib's softcut_jack_osc protocol"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+softcut = { path = "../softcut" }
+rosc = "0.11"
