@@ -10,7 +10,9 @@
 //! rates are resampled: inputs in their callback, steered against clock drift
 //! by a [`DriftServo`]; outputs in the render loop.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed,
+};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -18,6 +20,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use softcut::rt::{self, Handle, Processor};
 use softcut::{Engine, EngineConfig, Quirks};
 
+use crate::recorder::Recorder;
 use crate::resample::{DriftServo, Streamer};
 
 pub const VOICES: usize = 4;
@@ -34,6 +37,8 @@ const SCAN_BUDGET: usize = 32768;
 const INPUT_FILL: usize = 1024;
 /// Input frames queued beyond this are dropped, to bound input latency.
 const MAX_INPUT_BACKLOG: usize = 2 * INPUT_FILL;
+/// Seconds of output the recording ring holds while the writer catches up.
+const RECORD_SECONDS: usize = 2;
 /// Resampled output frames buffered between engine blocks.
 const PENDING_FRAMES: usize = 4096;
 /// Platforms where cpal opens an output device as a system-audio input.
@@ -147,6 +152,10 @@ pub struct Meters {
     /// Input callbacks that held any non-zero sample. macOS delivers exact
     /// silence, not an error, to an app without recording permission.
     input_signal: AtomicU64,
+    /// Written by the UI: copy the output mix to the recording ring.
+    recording: AtomicBool,
+    /// Output samples not recorded because the ring was full.
+    rec_dropped: AtomicU64,
     /// Frames from the buffer start that the waveform bins span. Written by the UI.
     view_frames: AtomicUsize,
 }
@@ -168,6 +177,11 @@ impl Meters {
     /// Frames the input device has delivered so far.
     pub fn input_frames(&self) -> u64 {
         self.input_frames.load(Relaxed)
+    }
+
+    /// Output samples lost from recordings because the writer fell behind.
+    pub fn rec_dropped(&self) -> u64 {
+        self.rec_dropped.load(Relaxed)
     }
 
     /// Input callbacks so far that were not exactly silent.
@@ -213,6 +227,9 @@ pub struct Audio {
     /// while a switch has two streams open.
     state: Arc<Mutex<AudioState>>,
     output: Output,
+    /// The recording ring's reader, held here between recordings.
+    rec_rx: Option<Consumer<f32>>,
+    recorder: Option<Recorder>,
 }
 
 impl Audio {
@@ -286,6 +303,40 @@ impl Audio {
                 Err(e)
             }
         }
+    }
+
+    /// Record the output mix to a stereo 32-bit float WAV at `path`.
+    pub fn start_recording(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let rx = self.rec_rx.take().ok_or("already recording")?;
+        match Recorder::start(rx, path, self.sample_rate as u32) {
+            Ok(rec) => {
+                self.recorder = Some(rec);
+                self.meters.rec_dropped.store(0, Relaxed);
+                self.meters.recording.store(true, Relaxed);
+                Ok(())
+            }
+            Err((rx, e)) => {
+                self.rec_rx = Some(rx);
+                Err(e)
+            }
+        }
+    }
+
+    /// Finish the recording; returns its path and length in seconds.
+    pub fn stop_recording(&mut self) -> Result<(std::path::PathBuf, f32), String> {
+        let rec = self.recorder.take().ok_or("not recording")?;
+        self.meters.recording.store(false, Relaxed);
+        let path = rec.path.clone();
+        let (rx, result) = rec.stop();
+        self.rec_rx = Some(rx);
+        result.map(|frames| (path, frames as f32 / self.sample_rate))
+    }
+
+    /// Seconds recorded so far, while recording.
+    pub fn recorded_seconds(&self) -> Option<f32> {
+        self.recorder
+            .as_ref()
+            .map(|r| r.frames() as f32 / self.sample_rate)
     }
 
     /// Index into `outputs` of the open device, if it is still listed.
@@ -381,17 +432,21 @@ pub fn start(setup: impl FnOnce(&mut Engine)) -> Result<Audio, String> {
     let (handle, processor) = rt::split(engine, 1024);
 
     let (input_tx, input_rx) = RingBuffer::<f32>::new(MAX_FRAMES * 4);
+    let (rec_tx, rec_rx) = RingBuffer::<f32>::new(sample_rate as usize * 2 * RECORD_SECONDS);
     let meters = Arc::new(Meters {
         source: AtomicU8::new(Source::Off as u8),
         peaks: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
         input_peak: AtomicU32::new(0),
         input_frames: AtomicU64::new(0),
         input_signal: AtomicU64::new(0),
+        recording: AtomicBool::new(false),
+        rec_dropped: AtomicU64::new(0),
         view_frames: AtomicUsize::new(BUFFER_FRAMES),
     });
     let state = Arc::new(Mutex::new(AudioState::new(
         processor,
         input_rx,
+        rec_tx,
         meters.clone(),
     )));
     let (stream, out_rate) = open_output(out_dev, sample_rate, state.clone())?;
@@ -418,6 +473,8 @@ pub fn start(setup: impl FnOnce(&mut Engine)) -> Result<Audio, String> {
             name: output_name,
             rate: out_rate,
         },
+        rec_rx: Some(rec_rx),
+        recorder: None,
     };
     audio.input_error = match audio.inputs.first() {
         Some(d) if !d.loopback => audio.select_input(0, 0).err(),
@@ -546,6 +603,15 @@ fn open_input(
     Ok((stream, channels, dev_rate))
 }
 
+/// Copy a rendered block to the recording ring while recording: all of it or
+/// none, so the file never loses one channel of a frame. A full ring drops
+/// the block rather than waiting for the writer.
+fn record(meters: &Meters, tx: &mut Producer<f32>, block: &[f32]) {
+    if meters.recording.load(Relaxed) && tx.push_entire_slice(block).is_err() {
+        meters.rec_dropped.fetch_add(block.len() as u64, Relaxed);
+    }
+}
+
 /// Write a stereo frame to a device frame: mixed on mono, into the first two
 /// channels otherwise.
 fn write_frame(dst: &mut [f32], lr: [f32; 2]) {
@@ -561,6 +627,8 @@ fn write_frame(dst: &mut [f32], lr: [f32; 2]) {
 struct AudioState {
     processor: Processor,
     input: Consumer<f32>,
+    /// Output mix frames for the recorder, while `Meters::recording` is set.
+    rec_tx: Producer<f32>,
     /// False until `INPUT_FILL` frames have queued, at startup and after an underrun.
     primed: bool,
     meters: Arc<Meters>,
@@ -577,10 +645,16 @@ struct AudioState {
 }
 
 impl AudioState {
-    fn new(processor: Processor, input: Consumer<f32>, meters: Arc<Meters>) -> Self {
+    fn new(
+        processor: Processor,
+        input: Consumer<f32>,
+        rec_tx: Producer<f32>,
+        meters: Arc<Meters>,
+    ) -> Self {
         Self {
             processor,
             input,
+            rec_tx,
             primed: false,
             meters,
             stereo_in: vec![0.0; MAX_FRAMES * 2],
@@ -613,6 +687,7 @@ impl AudioState {
                     &mut self.stereo_out[..frames * 2],
                 );
                 self.processor.process(inp, out);
+                record(&self.meters, &mut self.rec_tx, out);
                 for (dst, src) in chunk.chunks_exact_mut(channels).zip(out.as_chunks::<2>().0) {
                     write_frame(dst, *src);
                 }
@@ -635,6 +710,7 @@ impl AudioState {
                     &mut self.stereo_out[..BLOCK * 2],
                 );
                 self.processor.process(inp, out);
+                record(&self.meters, &mut self.rec_tx, out);
                 let (Some(rs), pending) = (self.out_resampler.as_mut(), &mut self.pending) else {
                     unreachable!("render_resampled without a resampler")
                 };
@@ -717,17 +793,77 @@ mod tests {
     use softcut::{EngineCmd, VoiceCmd};
 
     fn state(engine: Engine) -> (AudioState, Producer<f32>) {
+        let (st, tx, _rec) = state_rec(engine);
+        (st, tx)
+    }
+
+    /// The state, the input ring's writer and the recording ring's reader.
+    fn state_rec(engine: Engine) -> (AudioState, Producer<f32>, Consumer<f32>) {
         let (tx, rx) = RingBuffer::new(MAX_FRAMES * 4);
+        let (rec_tx, rec_rx) = RingBuffer::new(1 << 16);
         let meters = Arc::new(Meters {
             source: AtomicU8::new(Source::On as u8),
             peaks: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
             input_peak: AtomicU32::new(0),
             input_frames: AtomicU64::new(0),
             input_signal: AtomicU64::new(0),
+            recording: AtomicBool::new(false),
+            rec_dropped: AtomicU64::new(0),
             view_frames: AtomicUsize::new(BUFFER_FRAMES),
         });
         let (_handle, processor) = rt::split(engine, 16);
-        (AudioState::new(processor, rx, meters), tx)
+        (AudioState::new(processor, rx, rec_tx, meters), tx, rec_rx)
+    }
+
+    /// While recording, both render paths copy exactly the engine frames they
+    /// render: all of the direct path's, and the resampled path's at the
+    /// engine rate. Nothing is copied while not recording.
+    #[test]
+    fn recording_copies_the_rendered_mix() {
+        for device_rate in [44100, 48000] {
+            let mut e = engine(44100.0);
+            e.buffer_mut(0).fill(0.25);
+            for c in [
+                VoiceCmd::LoopEnd(1.0),
+                VoiceCmd::Loop(true),
+                VoiceCmd::Play(true),
+            ] {
+                e.apply(EngineCmd::Voice(0, c));
+            }
+            let (mut st, _tx, mut rec) = state_rec(e);
+            st.set_output_rate(44100, device_rate);
+            let mut data = vec![0.0; 512 * 2];
+            st.render(&mut data, 2);
+            assert_eq!(rec.slots(), 0, "copied while not recording");
+
+            st.meters.recording.store(true, Relaxed);
+            for _ in 0..10 {
+                st.render(&mut data, 2);
+            }
+            let got = rec.slots();
+            let chunk = rec.read_chunk(got).unwrap();
+            let (a, b) = chunk.as_slices();
+            let samples: Vec<f32> = a.iter().chain(b).copied().collect();
+            chunk.commit_all();
+            assert_eq!(got % 2, 0);
+            let frames = got / 2;
+            // Direct: exactly the 5120 device frames. Resampled: engine
+            // blocks of 64 covering 5120 device frames at 44.1/48.
+            let want = if device_rate == 44100 {
+                5120
+            } else {
+                5120 * 44100 / 48000
+            };
+            assert!(
+                frames.abs_diff(want) <= 128,
+                "{device_rate} Hz: {frames} frames"
+            );
+            assert!(
+                samples[1000..].iter().any(|&x| x != 0.0),
+                "silent recording"
+            );
+            assert_eq!(st.meters.rec_dropped(), 0);
+        }
     }
 
     /// A 1 kHz loop rendered from a 44.1 kHz engine to a 48 kHz device stays

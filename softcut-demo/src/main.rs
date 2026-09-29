@@ -10,6 +10,7 @@
 #![allow(clippy::needless_range_loop)]
 
 mod audio;
+mod recorder;
 mod resample;
 mod wav;
 
@@ -322,6 +323,17 @@ struct FadeZone {
 }
 
 impl VoiceUi {
+    /// A `Voice` with this voice's fade curves, for reading them on the UI
+    /// thread; the real voice lives on the audio thread.
+    fn shadow(&self, sample_rate: f32) -> Voice {
+        let mut shadow = Voice::with_quirks(sample_rate, Quirks::Fixed);
+        shadow.set_rec_fade_shape(self.rec_fade_shape);
+        shadow.set_pre_fade_shape(self.pre_fade_shape);
+        shadow.set_rec_delay_ratio(self.rec_delay_ratio);
+        shadow.set_pre_window_ratio(self.pre_window_ratio);
+        shadow
+    }
+
     fn fade_zones(&self) -> Vec<FadeZone> {
         if self.fade_time <= 0.0 {
             return Vec::new();
@@ -347,9 +359,14 @@ impl VoiceUi {
     }
 }
 
+/// The equal-power output gain of a head at fade progress `fade`.
+fn gain(fade: f32) -> f32 {
+    (fade * std::f32::consts::FRAC_PI_2).sin()
+}
+
 impl FadeZone {
-    /// Points (buffer seconds, output gain) along the fade.
-    fn curve(&self, fade_time: f32) -> impl Iterator<Item = (f32, f32)> + '_ {
+    /// Points (buffer seconds, fade progress) along the fade.
+    fn points(&self, fade_time: f32) -> impl Iterator<Item = (f32, f32)> + '_ {
         const N: usize = 32;
         (0..=N).map(move |k| {
             let progress = k as f32 / N as f32;
@@ -358,8 +375,7 @@ impl FadeZone {
             } else {
                 1.0 - progress
             };
-            let t = self.origin + self.dir * progress * fade_time;
-            (t, (fade * std::f32::consts::FRAC_PI_2).sin())
+            (self.origin + self.dir * progress * fade_time, fade)
         })
     }
 }
@@ -367,11 +383,7 @@ impl FadeZone {
 /// The voice's rec and pre curves and the heads' output gain against
 /// crossfade progress, read from a shadow `Voice` with the same settings.
 fn fade_curve_plot(ui: &mut egui::Ui, v: &VoiceUi, sample_rate: f32, color: Color32) {
-    let mut shadow = Voice::with_quirks(sample_rate, Quirks::Fixed);
-    shadow.set_rec_fade_shape(v.rec_fade_shape);
-    shadow.set_pre_fade_shape(v.pre_fade_shape);
-    shadow.set_rec_delay_ratio(v.rec_delay_ratio);
-    shadow.set_pre_window_ratio(v.pre_window_ratio);
+    let shadow = v.shadow(sample_rate);
 
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 90.0), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -644,6 +656,7 @@ impl App {
         let dim = ui.visuals().weak_text_color();
         let label = egui::FontId::monospace(11.0);
         let bin_w = rect.width() / WAVE_BINS as f32;
+        let shadow = self.voices[self.selected].shadow(self.audio.sample_rate);
 
         for b in 0..BUFFERS {
             let top = rect.top() + b as f32 * (lane_h + 4.0);
@@ -657,22 +670,40 @@ impl App {
                     Rect::from_x_y_ranges(x_of(v.loop_start)..=x_of(v.loop_end), lane.y_range());
                 let alpha = if i == self.selected { 60 } else { 22 };
                 painter.rect_filled(band, 0.0, COLORS[i].gamma_multiply_u8(alpha));
-                // Output gain across each crossfade, from 0 at the lane's
-                // bottom to 1 near its top.
+                // Across each crossfade, from 0 at the lane's bottom to 1 near
+                // its top: playback gain for every voice; for the selected
+                // voice also the levels it records with, which the fade
+                // curves shape.
+                let y = |level: f32| lane.bottom() - level * lane_h * 0.9;
                 let (width, alpha) = if i == self.selected {
                     (2.0, 255)
                 } else {
                     (1.0, 110)
                 };
                 for zone in v.fade_zones() {
-                    let points = zone
-                        .curve(v.fade_time)
-                        .map(|(t, g)| Pos2::new(x_of(t), lane.bottom() - g * lane_h * 0.9))
-                        .collect();
+                    let line = |f: &dyn Fn(f32) -> f32| -> Vec<Pos2> {
+                        zone.points(v.fade_time)
+                            .map(|(t, fade)| Pos2::new(x_of(t), y(f(fade))))
+                            .collect()
+                    };
                     painter.add(egui::Shape::line(
-                        points,
+                        line(&gain),
                         Stroke::new(width, COLORS[i].gamma_multiply_u8(alpha)),
                     ));
+                    // The rec and pre curves only shape what a crossfade records.
+                    if i == self.selected && v.rec {
+                        let rec = line(&|fade| v.rec_level * shadow.rec_fade_value(fade));
+                        painter.extend(egui::Shape::dashed_line(
+                            &rec,
+                            Stroke::new(1.5, COLORS[i]),
+                            4.0,
+                            3.0,
+                        ));
+                        let pre = line(&|fade| {
+                            v.pre_level + (1.0 - v.pre_level) * shadow.pre_fade_value(fade)
+                        });
+                        painter.add(egui::Shape::line(pre, Stroke::new(1.5, dim)));
+                    }
                 }
             }
             let mid = lane.center().y;
@@ -719,6 +750,13 @@ impl App {
             rect.right_bottom() + Vec2::new(-4.0, -2.0),
             egui::Align2::RIGHT_BOTTOM,
             format!("{len:.2} s"),
+            label.clone(),
+            dim,
+        );
+        painter.text(
+            rect.right_top() + Vec2::new(-4.0, 2.0),
+            egui::Align2::RIGHT_TOP,
+            "crossfades: solid = playback gain; while recording, dashed = rec level, grey = kept level",
             label,
             dim,
         );
@@ -811,7 +849,9 @@ impl App {
             row(
                 ui,
                 "fade time",
-                egui::Slider::new(&mut v.fade_time, 0.0..=1.0).suffix(" s"),
+                egui::Slider::new(&mut v.fade_time, 0.0..=10.0)
+                    .logarithmic(true)
+                    .suffix(" s"),
             );
             row(
                 ui,
@@ -919,7 +959,7 @@ impl App {
     }
 
     fn osc_row(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let mut on = self.osc.is_some();
             if ui
                 .checkbox(&mut on, "OSC")
@@ -1112,7 +1152,7 @@ impl App {
 
     /// Randomize targets, the selected voice or all, and a timer.
     fn random_row(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("randomize");
             let t = &mut self.targets;
             ui.checkbox(&mut t.rate, "rate")
@@ -1144,9 +1184,46 @@ impl App {
         });
     }
 
+    /// Start or stop recording the output mix.
+    fn record_button(&mut self, ui: &mut egui::Ui) {
+        let Some(secs) = self.audio.recorded_seconds() else {
+            if ui
+                .button("record output...")
+                .on_hover_text("record what you hear to a stereo 32-bit float WAV")
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("WAV", &["wav"])
+                    .set_file_name("softcut-recording.wav")
+                    .save_file()
+            {
+                self.status = match self.audio.start_recording(&path) {
+                    Ok(()) => "recording the output".into(),
+                    Err(e) => format!("record: {e}"),
+                };
+            }
+            return;
+        };
+        let text = egui::RichText::new(format!("stop recording ({secs:.1} s)"))
+            .color(Color32::from_rgb(230, 90, 80));
+        if ui.button(text).clicked() {
+            self.status = match self.audio.stop_recording() {
+                Ok((path, secs)) => {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    format!("recorded {name}: {secs:.1} s")
+                }
+                Err(e) => format!("record: {e}"),
+            };
+        }
+        let dropped = self.audio.meters.rec_dropped();
+        if dropped > 0 {
+            ui.label(format!("{} frames dropped", dropped / 2))
+                .on_hover_text("the disk writer fell behind");
+        }
+    }
+
     /// Input device, channel pair, on/off and level.
     fn input_row(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("input");
             let current = self.audio.input_device();
             let label = |d: &InputDevice| match (d.loopback, d.is_default) {
@@ -1386,7 +1463,7 @@ impl eframe::App for App {
             self.input_row(ui);
             self.random_row(ui);
             self.osc_row(ui);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("clear buffers").clicked() {
                     for b in 0..BUFFERS {
                         self.send(EngineCmd::ClearBuffer(b));
@@ -1413,6 +1490,7 @@ impl eframe::App for App {
                     let end = (self.content_seconds() * self.audio.sample_rate) as usize;
                     self.start_save(path, 0, end, &[0, 1]);
                 }
+                self.record_button(ui);
                 if let Some(len) = self.sample_seconds
                     && ui.button("fit sample").clicked()
                 {
@@ -1509,7 +1587,7 @@ impl App {
 fn main() -> eframe::Result {
     let app = App::new(start_audio());
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 680.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 760.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -1666,7 +1744,7 @@ mod tests {
             ..VoiceUi::preset(0)
         };
         let ends = |z: &FadeZone| {
-            let pts: Vec<_> = z.curve(v.fade_time).collect();
+            let pts: Vec<_> = z.points(v.fade_time).map(|(t, f)| (t, gain(f))).collect();
             (pts[0], *pts.last().unwrap())
         };
         let zones = v.fade_zones();
